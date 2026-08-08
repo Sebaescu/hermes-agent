@@ -117,6 +117,59 @@ const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n──────────
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
+// ─── Active Conversations System ──────────────────────────────
+// When Hermes sends a message to a contact (via /send), we register
+// a "conversation" with a TTL. While active, replies from that chat
+// are forwarded to the gateway even if the sender isn't in ALLOWED_USERS.
+// TTL: 10 minutes since last activity. Auto-expires.
+
+const CONVERSATION_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const activeConversations = new Map(); // chatId -> { expiresAt, name }
+
+function openConversation(chatId, name) {
+  activeConversations.set(chatId, {
+    expiresAt: Date.now() + CONVERSATION_TTL_MS,
+    name: name || chatId,
+  });
+  if (WHATSAPP_DEBUG) {
+    console.log(JSON.stringify({ event: 'conversation_opened', chatId, name: name || chatId, ttl_ms: CONVERSATION_TTL_MS }));
+  }
+}
+
+function extendConversation(chatId) {
+  const conv = activeConversations.get(chatId);
+  if (conv) {
+    conv.expiresAt = Date.now() + CONVERSATION_TTL_MS;
+    return true;
+  }
+  return false;
+}
+
+function isConversationActive(chatId) {
+  const conv = activeConversations.get(chatId);
+  if (!conv) return false;
+  if (Date.now() > conv.expiresAt) {
+    activeConversations.delete(chatId);
+    if (WHATSAPP_DEBUG) {
+      console.log(JSON.stringify({ event: 'conversation_expired', chatId, name: conv.name }));
+    }
+    return false;
+  }
+  return true;
+}
+
+// Cleanup expired conversations every minute
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, conv] of activeConversations) {
+    if (now > conv.expiresAt) {
+      activeConversations.delete(id);
+      if (WHATSAPP_DEBUG) {
+        console.log(JSON.stringify({ event: 'conversation_expired', chatId: id, name: conv.name }));
+      }
+    }
+  }
+}, 60000);
 const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
 const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
 // Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever
@@ -558,16 +611,36 @@ async function startSocket() {
       // Handle fromMe messages based on mode
       let fromOwner = false;
       if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) {
+        // In bot mode, allow fromMe group messages (owner is the only member
+        // or wants to send commands from a group). Echo-loop protection is
+        // handled later by recentlySentIds / REPLY_PREFIX check.
+        // In self-chat mode, keep ignoring fromMe group messages.
+        if (chatId.includes('status')) {
           emitDebugEvent({
             stage: 'ignored',
-            reason: isGroup ? 'from_me_group' : 'from_me_status',
+            reason: 'from_me_status',
+            chatId: redactWhatsAppId(chatId),
+          });
+          continue;
+        }
+        if (isGroup && WHATSAPP_MODE !== 'bot') {
+          emitDebugEvent({
+            stage: 'ignored',
+            reason: 'from_me_group',
             chatId: redactWhatsAppId(chatId),
           });
           continue;
         }
 
-        if (WHATSAPP_MODE === 'bot') {
+        // In bot mode, fromMe messages in groups are always from the owner
+        // (they typed in the group from their linked device). Skip the
+        // owner_message_gate which is designed for DMs and would drop them
+        // when FORWARD_OWNER_MESSAGES is not enabled. Echo-loop protection
+        // is handled later by recentlySentIds / REPLY_PREFIX check.
+        if (isGroup && WHATSAPP_MODE === 'bot') {
+          // Fall through to the echo/agent-echo check below
+          fromOwner = true;
+        } else if (WHATSAPP_MODE === 'bot') {
           // Bot mode: separate bot number. fromMe inbound is either
           //   (a) an echo of our own /send (recentlySentIds will catch it), or
           //   (b) a message the owner typed from their own phone using the
@@ -646,7 +719,10 @@ async function startSocket() {
           } catch {}
           continue;
         }
-        if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+        // Check allowlist OR active conversation
+        const isAllowed = matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR);
+        const inConversation = isConversationActive(chatId);
+        if (WHATSAPP_DM_POLICY !== 'pairing' && !isAllowed && !inConversation) {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
@@ -656,6 +732,10 @@ async function startSocket() {
             }));
           } catch {}
           continue;
+        }
+        // Extend conversation TTL if this is a reply in an active conversation
+        if (inConversation) {
+          extendConversation(chatId);
         }
       }
 
@@ -846,6 +926,11 @@ app.post('/send', async (req, res) => {
       if (chunks.length > 1 && i < chunks.length - 1) {
         await sleep(CHUNK_DELAY_MS);
       }
+    }
+
+    // Open a conversation so replies from this contact get forwarded
+    if (!chatId.endsWith('@g.us')) {
+      openConversation(chatId);
     }
 
     res.json({
@@ -1132,7 +1217,38 @@ if (PAIR_ONLY) {
     process.exit(1);
   });
 } else {
-  app.listen(PORT, '127.0.0.1', () => {
+// ─── Conversation control endpoints ──────────────────────────
+  app.post('/conversation/start', (req, res) => {
+    const { chatId, name } = req.body;
+    if (!chatId) return res.status(400).json({ error: 'chatId is required' });
+    openConversation(chatId, name);
+    res.json({ success: true, chatId, name: name || chatId, ttl_ms: CONVERSATION_TTL_MS });
+  });
+
+  app.post('/conversation/stop', (req, res) => {
+    const { chatId } = req.body;
+    if (!chatId) return res.status(400).json({ error: 'chatId is required' });
+    activeConversations.delete(chatId);
+    if (WHATSAPP_DEBUG) {
+      console.log(JSON.stringify({ event: 'conversation_closed', chatId }));
+    }
+    res.json({ success: true, chatId });
+  });
+
+  app.get('/conversations', (req, res) => {
+    const now = Date.now();
+    const list = [];
+    for (const [id, conv] of activeConversations) {
+      if (now <= conv.expiresAt) {
+        list.push({ chatId: id, name: conv.name, expiresInSeconds: Math.round((conv.expiresAt - now) / 1000) });
+      } else {
+        activeConversations.delete(id);
+      }
+    }
+    res.json({ conversations: list });
+  });
+
+    app.listen(PORT, '127.0.0.1', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
     if (ALLOWED_USERS.size > 0) {

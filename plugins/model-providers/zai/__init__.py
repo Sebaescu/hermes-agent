@@ -121,8 +121,9 @@ zai = ZaiProfile(
     signup_url="https://z.ai/",
     fallback_models=(
         "glm-5.2",
+        "glm-5.1",
         "glm-5",
-        "glm-4-9b",
+        "glm-4.7",
     ),
     base_url="https://api.z.ai/api/paas/v4",
     default_aux_model="glm-4.5-flash",
