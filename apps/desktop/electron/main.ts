@@ -10284,7 +10284,12 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     }
   }
 
-  const token = crypto.randomBytes(32).toString('base64url')
+  // NOTE: reuse a caller/.env-provided session token when present. External
+  // clients sharing it (e.g. Iris via ~/.hermes/.env) must match the backend,
+  // which adopts the same value through load_hermes_dotenv's override=True —
+  // otherwise we inject+probe a random token the backend overwrote, and
+  // /api/ws rejects it (token_mismatch) → desktop boot loop.
+  const token = process.env.HERMES_DASHBOARD_SESSION_TOKEN || crypto.randomBytes(32).toString('base64url')
 
   // Same update mutual exclusion as the primary window's waitForLocalStart
   // (#73822): pool backends spawn from the same venv, so an ungated respawn
@@ -10644,7 +10649,12 @@ async function startHermes() {
       rememberLog(`[env] login-shell PATH resolution unavailable (${loginShellPath.reason}); keeping inherited PATH`)
     }
 
-    const token = crypto.randomBytes(32).toString('base64url')
+    // NOTE: reuse a caller/.env-provided session token when present. External
+    // clients sharing it (e.g. Iris via ~/.hermes/.env) must match the backend,
+    // which adopts the same value through load_hermes_dotenv's override=True —
+    // otherwise we inject+probe a random token the backend overwrote, and
+    // /api/ws rejects it (token_mismatch) → desktop boot loop.
+    const token = process.env.HERMES_DASHBOARD_SESSION_TOKEN || crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
     const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
     // Pin the desktop's chosen profile via the global --profile flag. This is

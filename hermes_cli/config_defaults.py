@@ -1597,6 +1597,21 @@ DEFAULT_CONFIG = {
             "scope": "drain",
             "min_secret_chars": 43,
         },
+        # Desktop API-key service-credential configuration — read by the
+        # bundled ``dashboard_auth/desktop_api_key`` plugin. Lets a trusted
+        # local client (e.g. Iris) drive the desktop backend's agent surface.
+        # The KEY itself is a credential, NOT configured here: set it via the
+        # ``HERMES_DESKTOP_API_KEY`` env var (the .env-is-for-secrets rule).
+        # These are behavioural knobs only. The plugin is a no-op unless that
+        # env var is set to a >=256-bit key; a weak key is rejected at
+        # registration (fail-closed). The key is honored universally on
+        # ``/api/*`` and ``/api/ws`` (loopback trust model). ``scope`` is the
+        # capability label on the verified principal; ``min_secret_chars`` is
+        # the entropy bar (url-safe-b64 chars; 43 ~= 256 bits).
+        "desktop_api_key": {
+            "scope": "desktop-api",
+            "min_secret_chars": 43,
+        },
         # Public URL override (env: ``HERMES_DASHBOARD_PUBLIC_URL``).
         # When set, this is the complete authority — scheme + host +
         # optional path prefix (e.g. ``https://example.com/hermes``) —

@@ -597,6 +597,28 @@ def _has_valid_query_token(request: Request, path: str) -> bool:
     return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
 
 
+def _has_valid_api_key(request: Request) -> bool:
+    """True if the request carries a valid desktop API-key bearer.
+
+    Distinct from the ephemeral ``_SESSION_TOKEN``: a trusted local client
+    (e.g. Iris) presents a stable ``HERMES_DASHBOARD_API_KEY`` as
+    ``Authorization: Bearer …``. Verified through the shared token-provider
+    stack (``verify_bearer_token``) so the same key also authenticates the
+    ``/api/ws`` upgrade. Honored on every ``/api/*`` route — no per-route
+    registration — because local clients call dynamic paths like
+    ``/api/sessions/{id}``.
+    """
+    from hermes_cli.dashboard_auth.token_auth import (
+        extract_bearer_token,
+        verify_bearer_token,
+    )
+
+    token = extract_bearer_token(request)
+    if not token:
+        return False
+    return verify_bearer_token(token) is not None
+
+
 def _require_token(request: Request) -> None:
     """Authorize a sensitive endpoint, raising 401 if the caller isn't allowed.
 
@@ -832,7 +854,11 @@ async def auth_middleware(request: Request, call_next):
     path = request.url.path
     is_mcp_oauth_callback = path.startswith("/api/mcp/oauth/callback/")
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not is_mcp_oauth_callback:
-        if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
+        if (
+            not _has_valid_session_token(request)
+            and not _has_valid_query_token(request, path)
+            and not _has_valid_api_key(request)
+        ):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Unauthorized"},
@@ -15993,6 +16019,31 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     Audit-logs the rejection so operators can debug "WS keeps closing"
     issues from the log.
     """
+    # Universal API-key credential (trusted local clients like Iris): accepted
+    # in BOTH loopback and gated modes, ahead of the mode-specific token /
+    # ticket / internal paths. Read from the Authorization header (preferred —
+    # keeps the key out of URLs/logs) with a ``?api_key=`` query fallback.
+    # Verified through the same provider stack as the HTTP gate
+    # (``verify_bearer_token``). /api/ws itself does not log auth rejections,
+    # so log an invalid api-key here to make Iris-style misconfigs diagnosable.
+    from hermes_cli.dashboard_auth.token_auth import (
+        extract_bearer_from_header,
+        verify_bearer_token,
+    )
+
+    api_key = extract_bearer_from_header(
+        ws.headers.get("authorization", "")
+    ) or ws.query_params.get("api_key", "")
+    if api_key:
+        if verify_bearer_token(api_key) is not None:
+            return None, "api_key"
+        _log.warning(
+            "ws api-key rejected reason=api_key_invalid path=%s peer=%s",
+            ws.url.path,
+            ws.client.host if ws.client else "?",
+        )
+        return "api_key_invalid", "api_key"
+
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
         # Lazy import — keeps this function importable in test harnesses
@@ -18714,6 +18765,53 @@ def _write_dashboard_ready_file(actual_port: int) -> None:
         _log.warning("Failed to write dashboard ready file %r: %s", target, exc)
 
 
+def _write_desktop_backend_port_file(actual_port: int) -> None:
+    """Publish the desktop backend's live port to a stable, predictable file.
+
+    External trusted clients (e.g. Iris) drive the desktop backend's agent
+    surface, but the backend binds ``--port 0`` (ephemeral), so the port is
+    otherwise known only to the spawning Electron parent (stdout READY line /
+    per-spawn ready file, both consumed and discarded). This writes the live
+    port (and pid) to ``<HERMES_HOME>/runtime/desktop-backend.json`` so a local
+    client can discover the endpoint without port-scanning. Only written when
+    the backend is desktop-spawned (``HERMES_DESKTOP=1``); overwritten on every
+    boot. Atomic (tempfile + ``os.replace``), mirroring the ready-file writer.
+    """
+    if os.environ.get("HERMES_DESKTOP") != "1":
+        return
+    hermes_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    target = Path(hermes_home) / "runtime" / "desktop-backend.json"
+    tmp_name = ""
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(
+            {"port": int(actual_port), "pid": os.getpid()},
+            separators=(",", ":"),
+        )
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(target.parent),
+            prefix=f"{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+            tmp_name = fh.name
+        os.replace(tmp_name, target)
+    except Exception as exc:
+        if tmp_name:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except Exception:
+                pass
+        _log.warning(
+            "Failed to write desktop backend port file %r: %s", target, exc
+        )
+
+
 def _maybe_open_browser(
     host: str, actual_port: int, open_browser: bool, initial_profile: str
 ) -> None:
@@ -19100,6 +19198,7 @@ def start_server(
             app.state.bound_port = actual_port
 
             _write_dashboard_ready_file(actual_port)
+            _write_desktop_backend_port_file(actual_port)
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.

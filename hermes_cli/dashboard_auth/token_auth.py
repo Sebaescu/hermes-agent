@@ -87,18 +87,56 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+def extract_bearer_from_header(header_value: str) -> str:
+    """Return the bearer token from a raw ``Authorization`` header value, or "".
+
+    Accepts ``<scheme> <token>`` where scheme is "bearer" (case-insensitive).
+    Returns an empty string for a missing/malformed header or a non-bearer
+    scheme — the caller treats "" as "no token presented". Header-agnostic so
+    the WebSocket upgrade path (``ws.headers.get("authorization")``) and the
+    HTTP request path share one extractor.
+    """
+    auth = header_value or ""
+    parts = auth.split(" ", 1)
+    if len(parts) == 2 and parts[0].strip().lower() == "bearer":
+        return parts[1].strip()
+    return ""
+
+
 def extract_bearer_token(request: Request) -> str:
-    """Return the bearer token from the ``Authorization`` header, or "".
+    """Return the bearer token from the request's ``Authorization`` header, or "".
 
     Accepts ``<scheme> <token>`` where scheme is "bearer" (case-insensitive).
     Returns an empty string for a missing/malformed header or a non-bearer
     scheme — the caller treats "" as "no token presented".
     """
-    auth = request.headers.get("authorization", "")
-    parts = auth.split(" ", 1)
-    if len(parts) == 2 and parts[0].strip().lower() == "bearer":
-        return parts[1].strip()
-    return ""
+    return extract_bearer_from_header(request.headers.get("authorization", ""))
+
+
+def verify_bearer_token(token: str) -> Optional[TokenPrincipal]:
+    """Verify a raw bearer token against every token provider; return the principal.
+
+    Best-effort counterpart to :func:`authenticate_token` for callers that have
+    already extracted the token (e.g. from a WebSocket upgrade header or a
+    ``?api_key=`` query param). Returns the first accepting provider's
+    :class:`TokenPrincipal`, or ``None`` if no provider recognises the token.
+    Swallows ``ProviderError`` and any provider exception (a buggy/unreachable
+    provider must not crash the caller) — callers treat ``None`` as "reject".
+    """
+    if not token:
+        return None
+    for provider in list_token_providers():
+        try:
+            principal = provider.verify_token(token=token)
+        except Exception as e:  # noqa: BLE001 — a buggy provider must not 500 the caller
+            _log.warning(
+                "dashboard-auth: token provider %r raised during verify: %s",
+                provider.name, e,
+            )
+            continue
+        if principal is not None:
+            return principal
+    return None
 
 
 def authenticate_token(

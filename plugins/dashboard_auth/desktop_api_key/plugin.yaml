@@ -1,0 +1,7 @@
+name: desktop_api_key
+version: 1.0.0
+description: "Dashboard auth provider — non-interactive shared-bearer-secret for trusted local clients (e.g. Iris) that drive the desktop backend's agent surface. Verifies an inbound Authorization bearer (or ?api_key=) against HERMES_DESKTOP_API_KEY with a constant-time compare. Honored UNIVERSALLY on /api/* (HTTP) and /api/ws (WebSocket) by web_server.py via the list_token_providers stack — not on a single registered token route, so it covers dynamic client paths like /api/sessions/{id}. Fails CLOSED: a weak/short/low-entropy key (< 256 bits) is rejected at registration and the credential stays disabled. No-op when the env var is unset. Behavioural knobs (scope, min_secret_chars) live under dashboard.desktop_api_key in config.yaml. Loopback trust model — do not rely on this key alone on a public bind without the OAuth gate."
+author: NousResearch
+kind: backend
+requires_env:
+  - HERMES_DESKTOP_API_KEY

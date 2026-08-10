@@ -186,8 +186,18 @@ def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/p
         def get(self, k, default=""):
             return self._q.get(k, default)
 
+    class _Headers:
+        # Real starlette.WebSocket exposes case-insensitive headers; the
+        # api-key branch of _ws_auth_reason reads the Authorization header.
+        def __init__(self, h):
+            self._h = {k.lower(): v for k, v in (h or {}).items()}
+
+        def get(self, k, default=""):
+            return self._h.get(k.lower(), default)
+
     return SimpleNamespace(
         query_params=_QP(query),
+        headers=_Headers({}),
         client=SimpleNamespace(host=client_host),
         url=SimpleNamespace(path=path),
     )
