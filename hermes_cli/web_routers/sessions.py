@@ -703,10 +703,11 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
             and body.archived is None
             and body.pinned is None
             and body.unread is None
+            and body.color is None
         ):
             raise HTTPException(
                 status_code=400,
-                detail="Nothing to update; provide 'title', 'archived', 'pinned', and/or 'unread'.",
+                detail="Nothing to update; provide 'title', 'archived', 'pinned', 'unread', and/or 'color'.",
             )
         if body.title is not None:
             try:
@@ -720,6 +721,8 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
             db.set_session_pinned(sid, body.pinned)
         if body.unread is not None:
             db.set_session_read(sid, read=not body.unread)
+        if body.color is not None:
+            db.set_session_color(sid, body.color)
         result = {"ok": True, "title": db.get_session_title(sid) or ""}
         if body.archived is not None:
             result["archived"] = bool(body.archived)
@@ -727,6 +730,8 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
             result["pinned"] = bool(body.pinned)
         if body.unread is not None:
             result["unread"] = bool(body.unread)
+        if body.color is not None:
+            result["color"] = db.get_session_color(sid)
         return result
     finally:
         db.close()

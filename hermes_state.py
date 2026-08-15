@@ -8387,9 +8387,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             rowcount = cursor.rowcount
             if rowcount is None or rowcount < 0:
                 rowcount = conn.execute("SELECT changes()").fetchone()[0]
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
+    def set_session_color(self, session_id: str, color: Optional[str]) -> bool:
+        """Set or clear the display color of a session (and its whole
+        compression lineage).
+
+        ``color`` is a presentation-only accent (e.g. ``#22c55e``) surfaced in
+        sidebars across surfaces (Desktop, Odyssey). Unlike pin/archive it has
+        no sweep semantics — it only travels with the conversation. None or ""
+        clears it. The whole compression chain is flipped as a unit (same
+        contract as :meth:`set_session_pinned`) so the surfaced tip and the
+        root never disagree. Returns True when at least one row changed.
+        """
+        normalized = (color or "").strip() or None
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET color = ? WHERE id = ?",
+                (normalized, session_id),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
             return rowcount
         rowcount = self._execute_write(_do)
         return rowcount > 0
+
+    def get_session_color(self, session_id: str) -> Optional[str]:
+        """Return the stored display color for a session, or None."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT color FROM sessions WHERE id = ?", (session_id,)
+            )
+            row = cursor.fetchone()
+        return row["color"] if row else None
 
     def set_session_read(self, session_id: str, read: bool = True) -> bool:
         """Mark a session read or unread (and its whole compression lineage).

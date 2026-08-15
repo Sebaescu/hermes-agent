@@ -337,6 +337,11 @@ class SessionRename(BaseModel):
     # session explicitly unread, False marks it read up to now. Mirrored from
     # the Desktop sidebar's "Mark as unread"/"Mark as read". None = leave alone.
     unread: Optional[bool] = None
+    # Presentation-only accent color (e.g. "#22c55e") for sidebars across
+    # surfaces (Desktop, Odyssey). None/"" clears it. Synced to the backend so
+    # every surface sees the same color — Desktop used to keep it in local
+    # Electron localStorage, which no other client could read.
+    color: Optional[str] = None
     # Mutate a session belonging to another profile (opens its state.db). Omit
     # for the current/default profile.
     profile: Optional[str] = None
