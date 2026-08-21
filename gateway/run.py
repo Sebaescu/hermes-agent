@@ -10571,6 +10571,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _onb_err:
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
 
+        # Suppress busy-ack status messages on WhatsApp — contacts should
+        # never see "Redirected current run", "Queued for next turn", etc.
+        if event.source.platform == Platform.WHATSAPP:
+            return True
+
         reply_anchor = self._reply_anchor_for_event(event)
         thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
         try:
@@ -12062,7 +12067,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             content = row["content"]
             if row.get("needs_marker"):
-                content = RECOVERED_MARKER + content
+                # Suppress recovered-reply marker on WhatsApp
+                if platform != Platform.WHATSAPP:
+                    content = RECOVERED_MARKER + content
             metadata = (
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
@@ -20034,22 +20041,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
             if not home_env:
-                # Slack dispatches all Hermes commands through a single
-                # parent slash command `/hermes`; bare `/sethome` is not
-                # registered and would fail with "app did not respond".
-                sethome_cmd = (
-                    "/hermes sethome"
-                    if source.platform == Platform.SLACK
-                    else "/sethome"
-                )
-                notice = (
-                    f"📬 No home channel is set for {platform_name.title()}. "
-                    f"A home channel is where Hermes delivers cron job results "
-                    f"and cross-platform messages.\n\n"
-                    f"Type {sethome_cmd} to make this chat your home channel, "
-                    f"or ignore to skip."
-                )
-                await self._deliver_platform_notice(source, notice)
+                # Suppress sethome prompt on WhatsApp — contacts should not see this
+                if source.platform == Platform.WHATSAPP:
+                    pass
+                else:
+                    sethome_cmd = (
+                        "/hermes sethome"
+                        if source.platform == Platform.SLACK
+                        else "/sethome"
+                    )
+                    notice = (
+                        f"📬 No home channel is set for {platform_name.title()}. "
+                        f"A home channel is where Hermes delivers cron job results "
+                        f"and cross-platform messages.\n\n"
+                        f"Type {sethome_cmd} to make this chat your home channel, "
+                        f"or ignore to skip."
+                    )
+                    await self._deliver_platform_notice(source, notice)
         
         # -----------------------------------------------------------------
         # Voice channel awareness — deliver current voice channel state so
