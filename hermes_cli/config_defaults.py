@@ -2924,6 +2924,16 @@ DEFAULT_CONFIG = {
         # of leaving a wedged-but-alive zombie. Set to false to disable.
         "loop_watchdog": True,
 
+        # Opt-in approval mirror to Telegram. When true, a command-approval
+        # prompt raised in a session on ANY other platform (e.g. a web/Odyssey
+        # api_server session) is also sent — with interactive buttons — to the
+        # Telegram home channel, so the user can approve from their phone a
+        # session they are not watching. Both cards resolve the same
+        # per-session approval queue; the first tap wins and the second is
+        # answered gracefully as already resolved. Requires a connected
+        # Telegram adapter with a home channel; off by default.
+        "approval_mirror_telegram": False,
+
         # Whether the gateway keeps writing the legacy sessions.json mirror of
         # its routing index. The primary copy lives in state.db (the
         # gateway_routing table). Default True for backward compatibility with

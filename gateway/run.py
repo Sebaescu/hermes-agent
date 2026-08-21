@@ -6135,6 +6135,8 @@ class TurnRunner:
             # the redacted value.
             cmd = _redact_approval_command(cmd)
 
+            _mirror_now = False  # set True once the primary path delivered
+
             # Prefer button-based approval when the adapter supports it.
             # Check the *class* for the method, not the instance — avoids
             # false positives from MagicMock auto-attribute creation in tests.
@@ -6159,8 +6161,8 @@ class TurnRunner:
                         raise RuntimeError("send_exec_approval: loop unavailable")
                     _outcome = _approval_send_outcome(_approval_fut, timeout=15)
                     if _outcome == "sent":
-                        return
-                    if _outcome == "ambiguous":
+                        _mirror_now = True
+                    elif _outcome == "ambiguous":
                         # Timeout ≠ failure: the card may have posted with a
                         # late ack (slow platform API call or transient
                         # connector backpressure). The prompt
@@ -6174,10 +6176,11 @@ class TurnRunner:
                             "as possibly-delivered (no re-send; the prompt "
                             "stays armed for a late tap)"
                         )
-                        return
-                    logger.warning(
-                        "Button-based approval failed (send returned error), falling back to text"
-                    )
+                        _mirror_now = True
+                    else:
+                        logger.warning(
+                            "Button-based approval failed (send returned error), falling back to text"
+                        )
                 except Exception as _e:
                     logger.warning(
                         "Button-based approval failed, falling back to text: %s", _e
@@ -6187,30 +6190,113 @@ class TurnRunner:
             # typed prefix so Slack/Matrix users are told the form they
             # can actually type (`!approve`) — typed "/" is blocked in
             # Slack threads and reserved by Matrix clients.
-            _p = getattr(ctx._status_adapter, "typed_command_prefix", "/")
-            msg = _format_exec_approval_fallback(
-                cmd,
-                desc,
-                _p,
-                allow_permanent=approval_data.get("allow_permanent", True),
-                allow_session=approval_data.get("allow_session", True),
-                smart_denied=approval_data.get("smart_denied", False),
-            )
+            # Skipped when the button path already delivered (_mirror_now):
+            # falling through would duplicate the prompt on the primary
+            # platform (the original `return`s collapsed into this flag).
+            if not _mirror_now:
+                _p = getattr(ctx._status_adapter, "typed_command_prefix", "/")
+                msg = _format_exec_approval_fallback(
+                    cmd,
+                    desc,
+                    _p,
+                    allow_permanent=approval_data.get("allow_permanent", True),
+                    allow_session=approval_data.get("allow_session", True),
+                    smart_denied=approval_data.get("smart_denied", False),
+                )
+                try:
+                    _approval_send_fut = safe_schedule_threadsafe(
+                        ctx._status_adapter.send(
+                            ctx._status_chat_id,
+                            msg,
+                            metadata=_interim_metadata(ctx._status_thread_metadata),
+                        ),
+                        ctx._loop_for_step,
+                        logger=logger,
+                        log_message="Approval text-send scheduling error",
+                    )
+                    if _approval_send_fut is not None:
+                        _approval_send_fut.result(timeout=15)
+                    _mirror_now = True
+                except Exception as _e:
+                    logger.error("Failed to send approval request: %s", _e)
+
+            if _mirror_now:
+                _mirror_approval_to_telegram(
+                    cmd=cmd,
+                    desc=desc,
+                    approval_data=approval_data,
+                    session_platform=_approval_mirror_platform_of(ctx),
+                )
+
+        def _approval_mirror_platform_of(ctx) -> str:
+            # Best-effort platform name of the session's adapter for the
+            # mirror's same-platform skip (Telegram sessions already got
+            # their interactive card from the primary path).
             try:
-                _approval_send_fut = safe_schedule_threadsafe(
-                    ctx._status_adapter.send(
-                        ctx._status_chat_id,
-                        msg,
-                        metadata=_interim_metadata(ctx._status_thread_metadata),
+                return str(getattr(ctx._status_adapter, "platform", "") or "")
+            except Exception:
+                return ""
+
+        def _mirror_approval_to_telegram(
+            *,
+            cmd: str,
+            desc: str,
+            approval_data: dict,
+            session_platform: str,
+        ) -> None:
+            """Best-effort opt-in mirror of this approval to the Telegram home channel.
+
+            Bridges the "session I'm not watching" gap: a web/Odyssey
+            api_server session that hits a dangerous command gets the
+            prompt ONLY in the browser banner; if the user is away, the
+            agent blocks forever. When ``gateway.approval_mirror_telegram``
+            is true and a Telegram home channel is configured, ALSO send
+            the interactive approval card to Telegram so a tap on the
+            phone unblocks the session. Both cards resolve the same
+            per-session queue (``resolve_gateway_approval``); the first
+            tap wins and the second is answered gracefully as
+            already-resolved. Never raises, never delays the primary path.
+            """
+            try:
+                from gateway.config import Platform as _Plat
+
+                _runner = self._runner  # TurnRunner → owning GatewayRunner
+                if not getattr(_runner.config, "approval_mirror_telegram", False):
+                    return
+                if session_platform and "telegram" in session_platform.lower():
+                    return  # session already got its Telegram card
+                tg_adapter = _runner.adapters.get(_Plat.TELEGRAM)
+                if tg_adapter is None or not getattr(tg_adapter, "_bot", None):
+                    return
+                if getattr(type(tg_adapter), "send_exec_approval", None) is None:
+                    return  # adapter can't render interactive buttons
+                tg_cfg = _runner.config.platforms.get(_Plat.TELEGRAM)
+                home = getattr(tg_cfg, "home_channel", None) if tg_cfg else None
+                if home is None or not getattr(home, "chat_id", None):
+                    return
+                safe_schedule_threadsafe(
+                    tg_adapter.send_exec_approval(
+                        chat_id=str(home.chat_id),
+                        command=cmd,
+                        session_key=_approval_session_key,
+                        description=desc,
+                        metadata=None,
+                        allow_permanent=approval_data.get("allow_permanent", True),
+                        allow_session=approval_data.get("allow_session", True),
+                        smart_denied=approval_data.get("smart_denied", False),
                     ),
                     ctx._loop_for_step,
                     logger=logger,
-                    log_message="Approval text-send scheduling error",
+                    log_message="approval-mirror send scheduling error",
                 )
-                if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
-            except Exception as _e:
-                logger.error("Failed to send approval request: %s", _e)
+                logger.info(
+                    "Approval mirrored to Telegram home channel for session %s "
+                    "(session platform=%s)",
+                    _approval_session_key,
+                    session_platform or "unknown",
+                )
+            except Exception as _me:
+                logger.debug("Approval mirror to Telegram skipped: %s", _me)
 
         # Keep real user text separate from API-only recovery guidance.  If
         # an auto-continue note is prepended below, persist the original
