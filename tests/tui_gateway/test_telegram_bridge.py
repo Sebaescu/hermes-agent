@@ -26,6 +26,7 @@ shape):
 
 import asyncio
 import json
+import os
 import sys
 import threading
 import time
@@ -731,3 +732,49 @@ class TestAdapterRelay:
         )
         asyncio.run(adapter._handle_callback_query(update, None))
         assert relayed == ["dsh:ap:aabbccdd:once"]
+
+
+# ── Multi-server topology (dashboard + embedded serve) ──────────────────────
+
+class TestMultiWriterRegistry:
+    """Each server process registers its own endpoint; the relay fans out."""
+
+    def test_publish_writes_per_pid_file_and_legacy_first_writer(self, tmp_path, monkeypatch):
+        from tui_gateway import telegram_bridge as tb
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        tb.publish_bridge_info(9119)
+        multi = tmp_path / "runtime" / "telegram-bridge"
+        assert (multi / f"{os.getpid()}.json").exists()
+        legacy = tmp_path / "runtime" / "telegram-bridge.json"
+        assert legacy.exists()  # first writer wins the legacy slot
+
+        # A second publish (same pid) does NOT steal a legacy already owned
+        # by a live foreign pid — simulate by writing a foreign legacy first.
+        foreign = {"port": 1234, "pid": 999999, "token": "t", "endpoint": "/x"}
+        legacy.write_text(json.dumps(foreign))
+        tb.publish_bridge_info(9119)
+        assert json.loads(legacy.read_text())["pid"] == 999999
+
+    def test_read_bridge_infos_drops_dead_pids(self, tmp_path, monkeypatch):
+        from tui_gateway import telegram_bridge as tb
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        multi = tmp_path / "runtime" / "telegram-bridge"
+        multi.mkdir(parents=True)
+        # dead pid → pruned on read; live pid (ours) → kept
+        (multi / "1.json").write_text(json.dumps({"port": 1, "pid": 1, "token": "a", "endpoint": "/a"}))
+        (multi / f"{os.getpid()}.json").write_text(json.dumps({"port": 2, "pid": os.getpid(), "token": "b", "endpoint": "/b"}))
+        infos = tb.read_bridge_infos()
+        pids = [i["pid"] for i in infos]
+        assert 1 not in pids and os.getpid() in pids
+
+    def test_read_bridge_infos_falls_back_to_legacy(self, tmp_path, monkeypatch):
+        from tui_gateway import telegram_bridge as tb
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        (tmp_path / "runtime").mkdir(parents=True)
+        legacy = {"port": 9119, "pid": 42, "token": "tok", "endpoint": "/api/tgbridge/respond"}
+        (tmp_path / "runtime" / "telegram-bridge.json").write_text(json.dumps(legacy))
+        infos = tb.read_bridge_infos()
+        assert infos == [legacy]

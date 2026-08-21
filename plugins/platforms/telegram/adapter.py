@@ -7440,49 +7440,78 @@ class TelegramAdapter(BasePlatformAdapter):
 
         from hermes_constants import get_hermes_home
 
-        info_path = get_hermes_home() / "runtime" / "telegram-bridge.json"
-        endpoint = None
-        token = ""
-        try:
-            raw = _json.loads(info_path.read_text(encoding="utf-8"))
-            port = int(raw.get("port") or 0)
-            token = str(raw.get("token") or "")
-            path = str(raw.get("endpoint") or "/api/tgbridge/respond")
-            if port and token and path.startswith("/"):
-                endpoint = f"http://127.0.0.1:{port}{path}"
-        except Exception:
-            endpoint = None
+        RELAY_FALLBACK_PATH = "/api/tgbridge/respond"
 
-        if endpoint is None:
-            await query.answer(text="⚠ Dashboard bridge not available.")
-            logger.info("dsh callback dropped: no bridge info at %s", info_path)
-            return
+        # Multi-server topology: dashboard (:9119) AND an embedded
+        # ``hermes serve`` backend (Desktop app) can each host sessions with
+        # pending dsh: prompts. Try every live endpoint (per-pid registry
+        # first, legacy single file as fallback) — 404 from one process is
+        # "not mine", so keep going; the prompt lives in exactly one.
+        endpoints: list = []
+        try:
+            from tui_gateway.telegram_bridge import read_bridge_infos
+
+            for raw in read_bridge_infos():
+                _port = int(raw.get("port") or 0)
+                _token = str(raw.get("token") or "")
+                _path = str(raw.get("endpoint") or RELAY_FALLBACK_PATH)
+                if _port and _token and _path.startswith("/"):
+                    endpoints.append((f"http://127.0.0.1:{_port}{_path}", _token, raw))
+        except Exception:
+            endpoints = []
+        if not endpoints:
+            info_path = get_hermes_home() / "runtime" / "telegram-bridge.json"
+            try:
+                raw = _json.loads(info_path.read_text(encoding="utf-8"))
+                port = int(raw.get("port") or 0)
+                token = str(raw.get("token") or "")
+                path = str(raw.get("endpoint") or RELAY_FALLBACK_PATH)
+                if port and token and path.startswith("/"):
+                    endpoints.append((f"http://127.0.0.1:{port}{path}", token, raw))
+            except Exception:
+                endpoints = []
+            if not endpoints:
+                await query.answer(text="⚠ Dashboard bridge not available.")
+                logger.info("dsh callback dropped: no bridge info at %s", info_path)
+                return
 
         user_display = getattr(query.from_user, "first_name", None) or "User"
         body = {}
+        resp = None
         try:
             import httpx as _httpx
 
             async with _httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    endpoint,
-                    json={"callback_data": data, "user_display": user_display},
-                    headers={"X-Hermes-Bridge-Token": token},
-                )
-            if resp.status_code != 200:
+                for endpoint, token, _raw in endpoints:
+                    resp = await client.post(
+                        endpoint,
+                        json={"callback_data": data, "user_display": user_display},
+                        headers={"X-Hermes-Bridge-Token": token},
+                    )
+                    if resp.status_code == 200:
+                        break  # resolved in this process
+                    if resp.status_code != 404:
+                        break  # real error (400/401/5xx): surface it, don't fan out
+                    logger.info(
+                        "dsh callback not in bridge pid %s, trying next",
+                        _raw.get("pid"),
+                    )
+            if resp is None or resp.status_code != 200:
                 detail = ""
                 try:
-                    detail = resp.json().get("detail", "")
+                    detail = resp.json().get("detail", "") if resp is not None else ""
                 except Exception:
                     pass
-                if resp.status_code == 404:
+                if resp is not None and resp.status_code == 404:
                     await query.answer(text="⌛ Prompt already resolved or expired.")
-                elif resp.status_code == 400:
+                elif resp is not None and resp.status_code == 400:
                     await query.answer(text="⚠ Invalid bridge payload.")
                 else:
                     await query.answer(text=f"⚠ Bridge error ({resp.status_code}).")
                 logger.warning(
-                    "dsh callback relay failed: %s %s", resp.status_code, detail
+                    "dsh callback relay failed: %s %s",
+                    getattr(resp, "status_code", "none"),
+                    detail,
                 )
                 return
             body = resp.json() or {}

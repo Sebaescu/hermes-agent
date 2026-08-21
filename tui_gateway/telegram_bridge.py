@@ -53,6 +53,7 @@ logger = logging.getLogger("hermes.tui_gateway.telegram_bridge")
 # Relay-endpoint contract shared with plugins/platforms/telegram/adapter.py.
 # Keep both sides in sync.
 BRIDGE_INFO_FILENAME = "telegram-bridge.json"
+BRIDGE_DIR_NAME = "telegram-bridge"
 RELAY_ENDPOINT = "/api/tgbridge/respond"
 
 _config_lock = threading.Lock()
@@ -435,14 +436,19 @@ def get_bridge_token() -> str:
 
 
 def publish_bridge_info(port: int) -> None:
-    """Write ``<HERMES_HOME>/runtime/telegram-bridge.json`` (port + token).
+    """Announce this server process's relay endpoint.
 
-    Called when the dashboard's HTTP server boots — same lifecycle as the
-    desktop-backend port file. Atomic replace, 0600, profile-aware home.
+    Multi-writer topology (dashboard :9119 AND an embedded ``hermes serve``
+    backend can be alive at once, each hosting its own sessions): each
+    process writes its OWN file under ``runtime/telegram-bridge/<pid>.json``
+    and prunes entries whose pid is dead. The legacy single
+    ``telegram-bridge.json`` is still written (first-writer-wins) so older
+    gateway relays keep working across the upgrade. Atomic replace, 0600,
+    profile-aware home.
     """
     from hermes_constants import get_hermes_home
 
-    target = get_hermes_home() / "runtime" / BRIDGE_INFO_FILENAME
+    runtime_dir = get_hermes_home() / "runtime"
     payload = {
         "port": int(port),
         "pid": os.getpid(),
@@ -452,21 +458,80 @@ def publish_bridge_info(port: int) -> None:
     try:
         import tempfile
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=str(target.parent),
-            prefix=f"{target.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            fh.write(json.dumps(payload, separators=(",", ":")))
-        os.chmod(fh.name, 0o600)
-        tmp = fh.name
-        os.replace(tmp, target)
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        multi_dir = runtime_dir / BRIDGE_DIR_NAME
+        multi_dir.mkdir(parents=True, exist_ok=True)
+
+        def _atomic_write(target: Path) -> None:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=str(target.parent),
+                prefix=f"{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as fh:
+                fh.write(json.dumps(payload, separators=(",", ":")))
+            os.chmod(fh.name, 0o600)
+            os.replace(fh.name, target)
+
+        # 1) own per-pid registration (authoritative for the multi relay)
+        _atomic_write(multi_dir / f"{os.getpid()}.json")
+
+        # 2) prune dead pids' files (best-effort; skips our own)
+        try:
+            for f in multi_dir.glob("*.json"):
+                try:
+                    name_pid = int(f.stem)
+                except ValueError:
+                    continue
+                if name_pid != os.getpid():
+                    try:
+                        os.kill(name_pid, 0)
+                    except OSError:
+                        f.unlink(missing_ok=True)
+        except Exception:
+            logger.debug("telegram bridge: prune failed", exc_info=True)
+
+        # 3) legacy single file, first-writer-wins (existing winner keeps it;
+        #    the multi relay reads the per-pid registry, this is only for
+        #    older gateway processes that still read the legacy path)
+        legacy = runtime_dir / BRIDGE_INFO_FILENAME
+        if not legacy.exists():
+            _atomic_write(legacy)
     except Exception:
         logger.debug("telegram bridge: failed to publish bridge info", exc_info=True)
+
+
+def read_bridge_infos() -> list:
+    """All live relay endpoints, newest-pid-first.
+
+    Reads the per-pid registry (``runtime/telegram-bridge/*.json``), drops
+    entries whose pid no longer exists, and falls back to the legacy single
+    file when the registry is empty. Returned entries are dicts with
+    port/token/endpoint/pid.
+    """
+    from hermes_constants import get_hermes_home
+
+    out: list = []
+    try:
+        multi_dir = get_hermes_home() / "runtime" / BRIDGE_DIR_NAME
+        for f in sorted(multi_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                raw = json.loads(f.read_text(encoding="utf-8"))
+                pid = int(raw.get("pid") or 0)
+                if pid and pid != os.getpid():
+                    os.kill(pid, 0)  # raises OSError when dead
+                out.append(raw)
+            except (OSError, ValueError):
+                continue
+    except Exception:
+        pass
+    if not out:
+        legacy = read_bridge_info()
+        if legacy:
+            out.append(legacy)
+    return out
 
 
 def read_bridge_info() -> Optional[dict]:
