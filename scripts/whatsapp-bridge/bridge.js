@@ -123,7 +123,16 @@ const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
 // are forwarded to the gateway even if the sender isn't in ALLOWED_USERS.
 // TTL: 10 minutes since last activity. Auto-expires.
 
-const CONVERSATION_TTL_MS = 10 * 60 * 1000; // 10 minutes
+// Read TTL from settings (via contacts-server API)
+let CONVERSATION_TTL_MS = 10 * 60 * 1000;
+function refreshTTL() {
+  fetch('http://127.0.0.1:5555/settings')
+    .then(r => r.json())
+    .then(d => { CONVERSATION_TTL_MS = (d.conversation_ttl_minutes || 10) * 60 * 1000; })
+    .catch(() => {});
+}
+refreshTTL();
+setInterval(refreshTTL, 30000);
 const activeConversations = new Map(); // chatId -> { expiresAt, name }
 
 function openConversation(chatId, name) {
@@ -595,7 +604,17 @@ async function startSocket() {
     for (const msg of messages) {
       if (!msg.message) continue;
 
-      const chatId = msg.key.remoteJid;
+      let chatId = msg.key.remoteJid;
+      // Normalize LID → phone for DMs so conversations/allowlist match.
+      // WhatsApp increasingly routes DM replies via Linked Identity (LID)
+      // instead of the phone JID, breaking allowlist + conversation lookups.
+      if (chatId.endsWith('@lid')) {
+        const lidNum = chatId.replace(/@lid$/, '');
+        const mappedPhone = lidToPhone[lidNum];
+        if (mappedPhone) {
+          chatId = mappedPhone + '@s.whatsapp.net';
+        }
+      }
       const senderId = msg.key.participant || chatId;
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = senderId.replace(/@.*/, '');
@@ -1059,6 +1078,11 @@ app.post('/send-media', async (req, res) => {
         }
         const audioMime = (audioExt === 'ogg' || audioExt === 'opus') ? 'audio/ogg; codecs=opus' : 'audio/mpeg';
         msgPayload = { audio: audioBuffer, mimetype: audioMime, ptt: audioExt === 'ogg' || audioExt === 'opus' };
+        break;
+      }
+      case 'sticker': {
+        // Send as WhatsApp sticker. WebP is the native format.
+        msgPayload = { sticker: buffer };
         break;
       }
       case 'document':
