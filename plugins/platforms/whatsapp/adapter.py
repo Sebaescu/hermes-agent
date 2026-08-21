@@ -946,12 +946,54 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         chat_id = to_whatsapp_jid(chat_id)
 
+        # Intercept [sticker:filename] directives and send as stickers
+        import re as _re
+        _sticker_pattern = _re.compile(r'\[sticker:([^\]]+)\]')
+        _sticker_matches = _sticker_pattern.findall(content)
+        if _sticker_matches:
+            import aiohttp as _aiohttp
+            STICKERS_DIR = os.path.expanduser("~/.hermes/whatsapp-stickers")
+            for _sname in _sticker_matches:
+                _sname = _sname.strip()
+                _spath = os.path.join(STICKERS_DIR, _sname)
+                if os.path.isfile(_spath):
+                    try:
+                        async with self._http_session.post(
+                            f"http://127.0.0.1:{self._bridge_port}/send-media",
+                            json={
+                                "chatId": chat_id,
+                                "filePath": _spath,
+                                "mediaType": "sticker",
+                            },
+                            timeout=_aiohttp.ClientTimeout(total=15),
+                        ) as _resp:
+                            pass
+                    except Exception:
+                        pass
+            # Remove sticker directives from the text content
+            content = _sticker_pattern.sub('', content).strip()
+            if not content:
+                return SendResult(success=True, message_id=None)
+
         try:
             import aiohttp
 
             # Format and chunk the message
             formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self._outgoing_chunk_limit())
+            
+            # WhatsApp-style: split short newline-separated lines into
+            # individual messages (mimics how people type on WhatsApp).
+            # Only applies when lines are short (<200 chars each) and
+            # there are multiple lines — long paragraphs stay as-is.
+            if '\n' in formatted:
+                potential_msgs = formatted.split('\n')
+                stripped = [m.strip() for m in potential_msgs if m.strip()]
+                if len(stripped) > 1 and all(len(m) < 200 for m in stripped):
+                    chunks = stripped
+                else:
+                    chunks = self.truncate_message(formatted, self._outgoing_chunk_limit())
+            else:
+                chunks = self.truncate_message(formatted, self._outgoing_chunk_limit())
 
             sent_message_ids: list[str] = []
             last_message_id = None
@@ -989,6 +1031,27 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 continuation_message_ids=tuple(sent_message_ids[:-1]),
                 raw_response={"message_ids": sent_message_ids},
             )
+
+            # Auto-close conversation when reply is short or disengaging
+            # to stop burning tokens on off-topic chatter.
+            _DISENGAGE_WORDS = {'oka','ah ya','jaja','jajaja','mm','mmm','sii','dale','ok','buena','no','jaja no','ya','nel'}
+            _reply_lower = formatted.strip().lower().rstrip('.,!?')
+            # Check: exact match, OR first line is disengage, OR total reply is short (<15 chars)
+            _first_line = _reply_lower.split('\n')[0].strip() if '\n' in _reply_lower else _reply_lower
+            _is_disengage = (_reply_lower in _DISENGAGE_WORDS
+                             or _first_line in _DISENGAGE_WORDS
+                             or len(_reply_lower) < 15)
+            if _is_disengage and not chat_id.endswith('@g.us'):
+                try:
+                    async with self._http_session.post(
+                        f"http://127.0.0.1:{self._bridge_port}/conversation/stop",
+                        json={"chatId": chat_id},
+                        timeout=aiohttp.ClientTimeout(total=3),
+                    ) as _r:
+                        pass
+                except Exception:
+                    pass
+
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
@@ -1388,6 +1451,23 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] WhatsApp read receipt failed: %s", self.name, exc)
 
+    def _active_conversation_chat_ids(self) -> set:
+        """Return the set of chatIds with active conversations on the bridge.
+
+        Queries the bridge's /conversations endpoint (active-conversations patch).
+        Used to authorize DM senders the owner has recently messaged.
+        """
+        try:
+            import json
+            import urllib.request
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self._bridge_port}/conversations", timeout=3
+            ) as resp:
+                data = json.loads(resp.read())
+            return {c.get("chatId", "") for c in data.get("conversations", [])}
+        except Exception:
+            return set()
+
     # ── Text debounce batching ──────────────────────────────────────
 
     _SPLIT_THRESHOLD = 6000  # WhatsApp supports ~65K chars; generous threshold
@@ -1478,6 +1558,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             is_group = data.get("isGroup", False)
             chat_type = "group" if is_group else "dm"
             
+            # Check if there's an active conversation on the bridge for this chat.
+            # If so, authorize the sender so the gateway doesn't reject them.
+            # This implements the "conversation-based auto-reply" pattern: only
+            # contacts the owner has messaged (within TTL) can reply to the agent.
+            role_auth = False
+            if not is_group:
+                try:
+                    chat_id_for_check = data.get("chatId", "")
+                    active = self._active_conversation_chat_ids()
+                    if chat_id_for_check in active:
+                        role_auth = True
+                except Exception:
+                    pass
+            
             # Build source
             source = self.build_source(
                 chat_id=data.get("chatId", ""),
@@ -1485,6 +1579,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 chat_type=chat_type,
                 user_id=data.get("senderId"),
                 user_name=data.get("senderName"),
+                role_authorized=role_auth,
             )
             
             # Download media URLs to the local cache so agent tools
@@ -1632,6 +1727,26 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 metadata["whatsapp_from_owner"] = True
                 if not body.startswith(_OWNER_REPLY_PREFIX):
                     body = f"{_OWNER_REPLY_PREFIX}{body}"
+
+            # Inject sticker catalog so the agent knows what stickers are available
+            try:
+                import aiohttp as _aiohttp
+                async with _aiohttp.ClientSession() as _session:
+                    async with _session.get(
+                        "http://127.0.0.1:5555/sticker-triggers",
+                        timeout=_aiohttp.ClientTimeout(total=2),
+                    ) as _resp:
+                        if _resp.status == 200:
+                            _sd = await _resp.json()
+                            _triggers = _sd.get("triggers", {})
+                            if _triggers:
+                                _lines = []
+                                for _sname, _trigger in sorted(_triggers.items()):
+                                    _lines.append(f"  - {_sname}: {_trigger}")
+                                body += "\n\n[Available stickers - use [sticker:filename] in your reply to send one, e.g. [sticker:risa.webp]. Use sparingly, 1 max per reply, only when it fits naturally:]"
+                                body += "\n" + "\n".join(_lines)
+            except Exception:
+                pass
 
             return MessageEvent(
                 text=body,
