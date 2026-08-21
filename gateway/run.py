@@ -931,6 +931,45 @@ def _approval_send_outcome(future, timeout: float) -> str:
     return "failed"
 
 
+def _approval_mirror_target(
+    *,
+    config,
+    adapters,
+    session_platform: "str | None",
+) -> "tuple[object, str] | None":
+    """Resolve the Telegram mirror target for a non-Telegram approval prompt.
+
+    Returns ``(telegram_adapter, home_chat_id)`` when the opt-in mirror
+    should fire, ``None`` when it must not. Pure decision — no I/O, no
+    scheduling — so it stays directly testable:
+
+    * ``config.approval_mirror_telegram`` must be true (opt-in; default false)
+    * the session's own platform must NOT be telegram — a Telegram session
+      already got its interactive card from the primary path, mirroring would
+      duplicate it
+    * a connected Telegram adapter (``_bot`` live, ``send_exec_approval``
+      on the class) must exist
+    * the Telegram platform config must carry a home channel with a chat id
+      (same resolution the startup notification uses).
+    """
+    from gateway.config import Platform as _Plat
+
+    if not getattr(config, "approval_mirror_telegram", False):
+        return None
+    if session_platform and "telegram" in str(session_platform).lower():
+        return None  # session already got its Telegram card
+    tg_adapter = (adapters or {}).get(_Plat.TELEGRAM)
+    if tg_adapter is None or not getattr(tg_adapter, "_bot", None):
+        return None
+    if getattr(type(tg_adapter), "send_exec_approval", None) is None:
+        return None  # adapter can't render interactive buttons
+    tg_cfg = (getattr(config, "platforms", None) or {}).get(_Plat.TELEGRAM)
+    home = getattr(tg_cfg, "home_channel", None) if tg_cfg is not None else None
+    if home is None or not getattr(home, "chat_id", None):
+        return None
+    return tg_adapter, str(home.chat_id)
+
+
 def _clarify_send_disposition(fut, *, session_key: str, clarify_mod) -> "str | None":
     """Decide whether a clarify prompt send aborts the wait, per the boundary rule.
 
@@ -6237,6 +6276,19 @@ class TurnRunner:
             except Exception:
                 return ""
 
+        # TODO(sudo/secret mirror): the task also asked for a plain-text
+        # heads-up to the Telegram home channel when a non-telegram session
+        # waits on a sudo/secret prompt. No viable hook point exists today:
+        # sudo password capture (tools/terminal_tool.py::_prompt_for_sudo_
+        # password) only fires in interactive CLI contexts (HERMES_INTERACTIVE
+        # or a registered sudo callback) and gateway sessions never register
+        # one — in web/Odyssey sessions sudo fails gracefully ("a password is
+        # required") without blocking, so there is no gateway emission of a
+        # sudo/secret request to mirror. Hooking it would mean threading a
+        # notify callback through terminal_tool's TLS callback slots — a
+        # refactor beyond this surgical change. Revisit if/when the gateway
+        # grows a first-class secret-request prompt.
+
         def _mirror_approval_to_telegram(
             *,
             cmd: str,
@@ -6258,25 +6310,18 @@ class TurnRunner:
             already-resolved. Never raises, never delays the primary path.
             """
             try:
-                from gateway.config import Platform as _Plat
-
                 _runner = self._runner  # TurnRunner → owning GatewayRunner
-                if not getattr(_runner.config, "approval_mirror_telegram", False):
+                _target = _approval_mirror_target(
+                    config=_runner.config,
+                    adapters=_runner.adapters,
+                    session_platform=session_platform,
+                )
+                if _target is None:
                     return
-                if session_platform and "telegram" in session_platform.lower():
-                    return  # session already got its Telegram card
-                tg_adapter = _runner.adapters.get(_Plat.TELEGRAM)
-                if tg_adapter is None or not getattr(tg_adapter, "_bot", None):
-                    return
-                if getattr(type(tg_adapter), "send_exec_approval", None) is None:
-                    return  # adapter can't render interactive buttons
-                tg_cfg = _runner.config.platforms.get(_Plat.TELEGRAM)
-                home = getattr(tg_cfg, "home_channel", None) if tg_cfg else None
-                if home is None or not getattr(home, "chat_id", None):
-                    return
+                tg_adapter, home_chat_id = _target
                 safe_schedule_threadsafe(
                     tg_adapter.send_exec_approval(
-                        chat_id=str(home.chat_id),
+                        chat_id=home_chat_id,
                         command=cmd,
                         session_key=_approval_session_key,
                         description=desc,
