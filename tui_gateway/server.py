@@ -1993,6 +1993,28 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
     _emit("approval.request", sid, payload)
 
 
+def _approval_notify_cb(sid: str, session_key: str):
+    """Approval notifier combining both egress paths for dashboard sessions.
+
+    The TUI event (above) remains the primary surface; the Telegram mirror
+    (``gateway.approval_mirror_telegram``) is a best-effort secondary card so
+    an Odyssey/Desktop approval can be answered from the phone. The mirror
+    resolves through the same module-level approval state as the TUI card, so
+    whichever surface answers first wins.
+    """
+
+    def cb(data: dict | None) -> None:
+        _emit_approval_request(sid, data)
+        try:
+            from tui_gateway.telegram_bridge import mirror_approval
+
+            mirror_approval(sid, session_key, data)
+        except Exception:
+            logger.debug("telegram approval mirror failed", exc_info=True)
+
+    return cb
+
+
 def _status_update(sid: str, kind: str, text: str | None = None):
     body = (text if text is not None else kind).strip()
     if not body:
@@ -2424,9 +2446,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     load_permanent_allowlist,
                 )
 
-                register_gateway_notify(
-                    key, lambda data: _emit_approval_request(sid, data)
-                )
+                register_gateway_notify(key, _approval_notify_cb(sid, key))
                 notify_registered = True
                 load_permanent_allowlist()
             except Exception:
@@ -3483,6 +3503,37 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
+def _mirror_clarify_payload(tgb, rid: str, sid: str, payload: dict) -> None:
+    """Mirror one clarify.request payload to Telegram (single or batch).
+
+    Single-question payloads keep the historical shape (``question`` /
+    ``choices``); batch payloads carry ``questions`` — each question mirrors
+    as its own card, and answers relay back per-question via
+    ``question_id``. Free-text answers still need the TUI: only listed
+    choices are remotely clickable.
+    """
+    questions = payload.get("questions")
+    if isinstance(questions, list) and questions:
+        for entry in questions:
+            if not isinstance(entry, dict):
+                continue
+            tgb.mirror_clarify(
+                f"{rid}:{entry.get('qid', '')}",
+                sid,
+                str(entry.get("question") or ""),
+                entry.get("choices") or [],
+                multi_select=bool(entry.get("multi_select")),
+            )
+        return
+    tgb.mirror_clarify(
+        rid,
+        sid,
+        str(payload.get("question") or ""),
+        payload.get("choices") or [],
+        multi_select=bool(payload.get("multi_select")),
+    )
+
+
 def _block(
     event: str,
     sid: str,
@@ -3507,6 +3558,32 @@ def _block(
     batch_answers: dict | None = None
     try:
         _emit(event, sid, payload)
+        # Telegram mirror for dashboard sessions (Odyssey/Desktop): the TUI
+        # event above is the primary surface; when
+        # ``gateway.approval_mirror_telegram`` is on, ALSO mirror the prompt
+        # to the Telegram home channel. Clarify gets clickable choice
+        # buttons; sudo/secret get a text-only notification (credentials are
+        # never entered over Telegram — see telegram_bridge). Best-effort and
+        # fire-and-forget so this path can never delay the block below.
+        if event in ("clarify.request", "sudo.request", "secret.request"):
+            try:
+                from tui_gateway import telegram_bridge as _tgb
+
+                _sess = _sessions.get(sid) or {}
+                _sk = str(_sess.get("session_key") or "")
+                if not _tgb._is_telegram_session(_sk):
+                    if event == "clarify.request":
+                        _mirror_clarify_payload(_tgb, rid, sid, payload)
+                    elif event == "sudo.request":
+                        _tgb.notify_sudo(sid)
+                    else:
+                        _tgb.notify_secret(
+                            sid,
+                            str(payload.get("env_var") or ""),
+                            str(payload.get("prompt") or ""),
+                        )
+            except Exception:
+                logger.debug("telegram prompt mirror failed", exc_info=True)
         # Natural Event semantics: None → wait forever (clarify configured with
         # clarify_timeout <= 0, released only by a real answer or
         # session.interrupt), 0 → return immediately, > 0 → bounded wait.
@@ -5468,7 +5545,7 @@ def _sync_session_key_after_compress(
         try:
             register_gateway_notify(
                 new_session_id,
-                lambda data: _emit_approval_request(sid, data),
+                _approval_notify_cb(sid, new_session_id),
             )
         except Exception:
             pass
@@ -7299,7 +7376,7 @@ def _init_session(
     try:
         from tools.approval import register_gateway_notify, load_permanent_allowlist
 
-        register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
+        register_gateway_notify(key, _approval_notify_cb(sid, key))
         load_permanent_allowlist()
     except Exception:
         pass

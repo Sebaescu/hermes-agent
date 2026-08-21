@@ -4312,6 +4312,111 @@ async def run_prompt_size():
     return {"ok": True, "pid": proc.pid, "name": "prompt-size"}
 
 
+# ---------------------------------------------------------------------------
+# Telegram↔Dashboard bridge relay (see tui_gateway/telegram_bridge.py).
+# The messaging gateway's Telegram adapter forwards ``dsh:*`` callback taps
+# here; this process owns the live dashboard sessions (Odyssey/Desktop), so
+# the approvals/clarifies are resolved against module-level state IN THIS
+# PROCESS. Auth: per-boot bridge token published in
+# <HERMES_HOME>/runtime/telegram-bridge.json (constant-time compared), plus
+# loopback-only enforcement — this route must never answer a remote peer.
+# ---------------------------------------------------------------------------
+
+
+class _TgBridgeRespondRequest(BaseModel):
+    callback_data: str
+    user_display: Optional[str] = None
+
+
+@app.post("/api/tgbridge/respond")
+async def tgbridge_respond(request: Request, body: _TgBridgeRespondRequest):
+    from tui_gateway.telegram_bridge import parse_relay_callback, verify_relay_token
+
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        return JSONResponse(status_code=403, content={"detail": "loopback only"})
+
+    presented = request.headers.get("x-hermes-bridge-token", "")
+    if not verify_relay_token(presented or None):
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    parsed = parse_relay_callback(body.callback_data)
+    if not parsed:
+        return JSONResponse(status_code=400, content={"detail": "bad callback_data"})
+
+    if parsed["kind"] == "approval":
+        from tui_gateway.telegram_bridge import session_key_for_hash
+        from tools.approval import resolve_gateway_approval
+
+        session_key = session_key_for_hash(parsed["sk_hash"])
+        if not session_key:
+            return JSONResponse(
+                status_code=404, content={"detail": "unknown approval session"}
+            )
+        count = resolve_gateway_approval(session_key, parsed["choice"])
+        return {"ok": True, "resolved": count}
+
+    # clarify: resolve through the SAME path clarify.respond uses.
+    import sys as _sys
+
+    server = _sys.modules.get("tui_gateway.server")
+    if server is None:
+        return JSONResponse(
+            status_code=503, content={"detail": "tui gateway not loaded"}
+        )
+
+    # Recover the decorated choice label the agent's callback expects: the
+    # clarify payload was emitted with the full choice list; _respond carries
+    # it back verbatim (strip_recommended on the tool side removes the label).
+    rid = parsed["request_id"]
+    with server._prompt_lock:
+        entry = server._pending_prompt_payloads.get(rid)
+        if not entry:
+            return JSONResponse(
+                status_code=404, content={"detail": "no pending clarify"}
+            )
+        _event_name, prompt_payload = entry
+    question_id = parsed.get("question_id", "")
+    if question_id:
+        # Batch: the payload carries the question list; index into it by qid.
+        answer = None
+        for q in prompt_payload.get("questions") or []:
+            if isinstance(q, dict) and q.get("qid") == question_id:
+                choices = q.get("choices") or []
+                if 0 <= parsed["answer_idx"] < len(choices):
+                    answer = str(choices[parsed["answer_idx"]])
+                break
+        if answer is None:
+            return JSONResponse(
+                status_code=400, content={"detail": "bad question/choice index"}
+            )
+    else:
+        choices = prompt_payload.get("choices") or []
+        if not (0 <= parsed["answer_idx"] < len(choices)):
+            return JSONResponse(
+                status_code=400, content={"detail": "bad choice index"}
+            )
+        answer = str(choices[parsed["answer_idx"]])
+
+    result = server._respond(
+        0,
+        {
+            "request_id": rid,
+            "question_id": question_id,
+            "answer": answer,
+        },
+        "answer",
+        allow_expired=True,
+    )
+    # _respond returns a JSON-RPC response dict; surface ok/err to the relay.
+    err = (result or {}).get("error")
+    if err:
+        return JSONResponse(
+            status_code=409, content={"detail": str(err.get("message", "error"))}
+        )
+    return {"ok": True}
+
+
 @app.post("/api/ops/dump")
 async def run_dump():
     try:
@@ -19199,6 +19304,16 @@ def start_server(
 
             _write_dashboard_ready_file(actual_port)
             _write_desktop_backend_port_file(actual_port)
+            # Telegram↔dashboard bridge: publish the loopback relay endpoint
+            # (port + per-boot token) so the messaging gateway's Telegram
+            # adapter can forward ``dsh:*`` callback taps to THIS process,
+            # where the live Odyssey/Desktop sessions actually live.
+            try:
+                from tui_gateway.telegram_bridge import publish_bridge_info
+
+                publish_bridge_info(actual_port)
+            except Exception:
+                _log.debug("telegram bridge info publish skipped", exc_info=True)
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.

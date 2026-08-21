@@ -7057,6 +7057,25 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._handle_choice_picker_callback(query, data, chat_id)
             return
 
+        # --- Dashboard-session bridge callbacks (dsh:*, Odyssey/Desktop) ---
+        # Approvals/clarifies mirrored by the dashboard process carry a
+        # ``dsh:`` prefix — their live agent state lives in THAT process, so
+        # we relay the tap to its loopback relay endpoint instead of
+        # resolving locally. See tui_gateway/telegram_bridge.py.
+        if data.startswith("dsh:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to answer this prompt.")
+                return
+            await self._handle_dashboard_bridge_callback(query, data)
+            return
+
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
             await self._handle_gmail_triage_callback(
@@ -7407,6 +7426,104 @@ class TelegramAdapter(BasePlatformAdapter):
                         answer, getattr(query.from_user, "id", "unknown"))
         except Exception as exc:
             logger.error("Failed to write update response from callback: %s", exc)
+
+    async def _handle_dashboard_bridge_callback(self, query, data: str) -> None:
+        """Relay a ``dsh:*`` tap to the dashboard process (Odyssey/Desktop).
+
+        Approvals and clarifies for dashboard-hosted sessions live in the
+        DASHBOARD process (``tui_gateway.server`` module state), not here.
+        The dashboard publishes its loopback endpoint + per-boot token in
+        ``<HERMES_HOME>/runtime/telegram-bridge.json``; this forwards the raw
+        callback_data there and reflects the outcome on the tapped card.
+        """
+        import json as _json
+
+        from hermes_constants import get_hermes_home
+
+        info_path = get_hermes_home() / "runtime" / "telegram-bridge.json"
+        endpoint = None
+        token = ""
+        try:
+            raw = _json.loads(info_path.read_text(encoding="utf-8"))
+            port = int(raw.get("port") or 0)
+            token = str(raw.get("token") or "")
+            path = str(raw.get("endpoint") or "/api/tgbridge/respond")
+            if port and token and path.startswith("/"):
+                endpoint = f"http://127.0.0.1:{port}{path}"
+        except Exception:
+            endpoint = None
+
+        if endpoint is None:
+            await query.answer(text="⚠ Dashboard bridge not available.")
+            logger.info("dsh callback dropped: no bridge info at %s", info_path)
+            return
+
+        user_display = getattr(query.from_user, "first_name", None) or "User"
+        body = {}
+        try:
+            import httpx as _httpx
+
+            async with _httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    endpoint,
+                    json={"callback_data": data, "user_display": user_display},
+                    headers={"X-Hermes-Bridge-Token": token},
+                )
+            if resp.status_code != 200:
+                detail = ""
+                try:
+                    detail = resp.json().get("detail", "")
+                except Exception:
+                    pass
+                if resp.status_code == 404:
+                    await query.answer(text="⌛ Prompt already resolved or expired.")
+                elif resp.status_code == 400:
+                    await query.answer(text="⚠ Invalid bridge payload.")
+                else:
+                    await query.answer(text=f"⚠ Bridge error ({resp.status_code}).")
+                logger.warning(
+                    "dsh callback relay failed: %s %s", resp.status_code, detail
+                )
+                return
+            body = resp.json() or {}
+        except Exception as exc:
+            await query.answer(text="⚠ Dashboard unreachable.")
+            logger.warning("dsh callback relay failed: %s", exc)
+            return
+
+        await query.answer(text="✅ Answered.")
+
+        # Reflect the outcome on the tapped card. Approvals edit to the
+        # decision; clarifies keep the card but note who answered — a batch
+        # or multi-select card stays tappable for the remaining choices.
+        try:
+            if data.startswith("dsh:ap:"):
+                choice = data.split(":")[3] if len(data.split(":")) == 4 else ""
+                label_map = {
+                    "once": "✅ Approved once",
+                    "session": "✅ Approved for session",
+                    "always": "✅ Approved permanently",
+                    "deny": "❌ Denied",
+                }
+                resolved = int((body or {}).get("resolved") or 0)
+                if resolved:
+                    label = label_map.get(choice, "Resolved")
+                    edit_text = f"{label} by {user_display}"
+                else:
+                    edit_text = "⌛ Approval expired — no command was waiting."
+                await query.edit_message_text(
+                    text=edit_text,
+                    reply_markup=None,
+                )
+            else:
+                await query.edit_message_text(
+                    text=(
+                        f"✅ Answered by {user_display}"
+                        " — remaining choices stay tappable."
+                    ),
+                )
+        except Exception:
+            pass  # non-fatal if edit fails
 
     # Maps `gt:<verb>` -> (script-name, extra-args, success-label, is_state).
     # Scripts live in ~/.hermes/scripts/gmail-triage/. `arg` from the callback

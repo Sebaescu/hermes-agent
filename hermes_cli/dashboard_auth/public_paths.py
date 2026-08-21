@@ -57,4 +57,11 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # the NAS relay's bearer-only callback reaches the verifier instead of a
     # 401 no_cookie. The JWT — not this allowlist — is the security boundary.
     "/api/cron/fire",
+    # Telegram→dashboard bridge relay (gateway adapter -> this process, for
+    # Odyssey/Desktop approval+clarify taps). Same pattern as /api/cron/fire:
+    # the caller is a local service with no cookie/session; the handler
+    # verifies its own per-boot bridge token (constant-time, published in
+    # <HERMES_HOME>/runtime/telegram-bridge.json) AND enforces loopback-only.
+    # The bridge token — not this allowlist — is the security boundary.
+    "/api/tgbridge/respond",
 })
