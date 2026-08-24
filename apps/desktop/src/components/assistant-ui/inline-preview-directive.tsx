@@ -5,8 +5,12 @@ import { requestComposerSubmit } from '@/app/chat/composer/focus'
 import { useSessionView } from '@/app/chat/session-view'
 import { useIsDark } from '@/components/assistant-ui/embeds/use-is-dark'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
+import { useI18n } from '@/i18n'
+import { MonitorPlay } from '@/lib/icons'
 import { localPreviewTarget } from '@/lib/local-preview'
 import { isRemoteGateway } from '@/lib/media'
+import { previewName } from '@/lib/preview-targets'
+import { cn } from '@/lib/utils'
 
 /**
  * `::preview{file="…"}` — a workspace HTML file rendered LIVE inside the
@@ -259,18 +263,65 @@ export function InlinePreviewDirective({
     return file ? <PreviewAttachment source="explicit-link" target={file} /> : null
   }
 
-  return <InlineHtmlFrame file={file} initialHeight={directiveFrameHeight(attrs.height)} streaming={streaming} />
+  return (
+    <CollapsedInlinePreview file={file} initialHeight={directiveFrameHeight(attrs.height)} streaming={streaming} />
+  )
 }
 
-function InlineHtmlFrame({
+/**
+ * Collapsed by default: the transcript shows the file's card (icon + name +
+ * "Ver"), and only an explicit click mounts the frame. Mounting lazily also
+ * skips the file read + iframe for every rendered directive in a transcript —
+ * the collapse IS the lazy gate.
+ */
+function CollapsedInlinePreview({
   file,
   initialHeight,
   streaming
 }: {
   file: string
+  initialHeight: number | null
+  streaming: boolean
+}) {
+  const { t } = useI18n()
+  const [open, setOpen] = useState(false)
+  const name = previewName(file)
+
+  return (
+    <div className="my-2 w-full max-w-160">
+      <div className="flex w-full items-center gap-2 rounded-lg border border-(--ui-stroke-tertiary) bg-card/55 px-2.5 py-1.5 text-sm">
+        <span className="grid size-6 shrink-0 place-items-center rounded-md bg-muted/55 text-muted-foreground/85">
+          <MonitorPlay className="size-3.5" />
+        </span>
+        <span className="min-w-0 flex-1 truncate text-[0.78rem] font-medium text-foreground/90" title={file}>
+          {name}
+        </span>
+        <button
+          className="shrink-0 rounded-md border border-(--ui-stroke-tertiary) bg-background/40 px-2 py-1 text-[0.7rem] font-medium text-muted-foreground transition-colors hover:bg-accent/55 hover:text-foreground"
+          onClick={() => setOpen(prev => !prev)}
+          type="button"
+        >
+          {open ? t.preview.hide : t.preview.openPreview}
+        </button>
+      </div>
+      {open && (
+        <InlineHtmlFrame file={file} initialHeight={initialHeight} streaming={streaming} className="mt-1.5" />
+      )}
+    </div>
+  )
+}
+
+function InlineHtmlFrame({
+  file,
+  initialHeight,
+  streaming,
+  className
+}: {
+  file: string
   /** `height` attribute — the starting height only; measurement overrides. */
   initialHeight: number | null
   streaming: boolean
+  className?: string
 }) {
   const cwd = useStore(useSessionView().$cwd)
   const isDark = useIsDark()
@@ -389,7 +440,7 @@ function InlineHtmlFrame({
   const width = contentWidth !== null ? Math.min(contentWidth, MAX_COLUMN_WIDTH) : undefined
 
   return (
-    <span className="my-2 block w-full max-w-160">
+    <span className={cn('my-2 block w-full max-w-160', className)}>
       {framedDoc === null ? (
         <span
           className="block w-full animate-pulse rounded-md bg-[color-mix(in_srgb,currentColor_4%,transparent)]"
