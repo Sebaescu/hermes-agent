@@ -532,55 +532,30 @@ class GatewayKanbanWatchersMixin:
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
                         if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
-                            payload_summary = None
+                            # Notificación compacta (feedback Seb 2026-08-25):
+                            # preview = título solo. El WAKE al orquestador sí
+                            # lleva el handoff (para inspección del board) —
+                            # se saca del summary del evento, con fallback a
+                            # task.result (filas legacy sin runs).
                             if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
-                                wake_handoff = h
+                                wake_handoff = str(ev.payload["summary"]).strip()[:200]
                             elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
-                                wake_handoff = r
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
+                                lines = str(task.result).strip().splitlines()
+                                if lines:
+                                    wake_handoff = lines[0][:200]
+                            msg = f"✔ {board_tag}{tag}{title}"
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                                first = str(ev.payload["reason"]).strip().splitlines()[0]
+                                reason = f" — {first[:60]}"
+                            msg = f"⏸ {board_tag}{tag}{title}{reason}"
                         elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
+                            msg = f"✖ {board_tag}{tag}{title} — reintentos agotados"
                         elif kind == "crashed":
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
-                            )
+                            msg = f"✖ {board_tag}{tag}{title} — crashed, reintento automático"
                         elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
+                            msg = f"⏱ {board_tag}{tag}{title} — timeout, reintento automático"
                         elif kind == "status":
                             new_status = ""
                             if ev.payload and ev.payload.get("status"):

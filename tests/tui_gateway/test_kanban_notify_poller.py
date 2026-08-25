@@ -72,9 +72,9 @@ class TestCollectKanbanNotifications:
         first = _collect_kanban_notifications(_session())
 
         assert len(first) == 1
-        assert tid in first[0]
-        assert "done" in first[0]
-        assert "shipped the fix" in first[0]
+        assert "notify tui" in first[0]
+        assert first[0].startswith("✔")
+        # El summary ya no va en el preview (compacto) — vive en el board.
         rows = _sub_rows(tid)
         assert len(rows) == 1, "done must retain the originating session"
         first_cursor = rows[0]["last_event_id"]
@@ -97,7 +97,7 @@ class TestCollectKanbanNotifications:
 
         assert len(reopened) == 2
         assert "ready" in reopened[0]
-        assert "review corrections" in reopened[1]
+        assert reopened[1].startswith("✔")  # compacto: título solo
         rows = _sub_rows(tid)
         assert len(rows) == 1
         assert rows[0]["chat_id"] == SESSION_KEY
@@ -128,7 +128,7 @@ class TestCollectKanbanNotifications:
             second = _collect_kanban_notifications(_session())
 
         assert len(first) == 1
-        assert "blocked" in first[0]
+        assert first[0].startswith("⏸")
         assert "waiting on review" in first[0]
         assert second == []
         assert spy_connect.called
@@ -180,7 +180,7 @@ class TestCollectKanbanNotifications:
             texts = _collect_kanban_notifications(_session())
 
         assert len(texts) == 1
-        assert tid in texts[0]
+        assert "notify tui" in texts[0]
         spy_connect.assert_called_once()
 
     def test_no_session_key_is_a_noop(self):
@@ -223,8 +223,8 @@ class TestCollectKanbanNotifications:
             reset_hermes_home_override(token)
 
         assert len(texts) == 1
-        assert tid in texts[0]
-        assert "cross-profile delivery" in texts[0]
+        assert "notify tui" in texts[0]
+        # Compacto: solo título; el detalle vive en el board.
         # Completion is reversible, so the shared-board subscription remains
         # owned by this exact Desktop session until the task is archived.
         rows = _sub_rows(tid)
@@ -244,23 +244,23 @@ class TestFormatKanbanEventText:
     def test_blocked_includes_reason(self):
         ev = SimpleNamespace(kind="blocked", payload={"reason": "needs creds"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
-        assert "t_abc123" in text
-        assert "blocked" in text
-        assert "needs creds" in text
+        assert "build the thing" in text
+        assert "needs creds" in text  # razón corta sí va
         assert "[main]" in text
         assert "@worker" in text
 
-    def test_completed_prefers_payload_summary(self):
+    def test_completed_compact_title_only(self):
         ev = SimpleNamespace(kind="completed", payload={"summary": "first line\nsecond"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
-        assert "done" in text
-        assert "first line" in text
-        assert "second" not in text
+        assert text.startswith("✔")
+        assert "build the thing" in text
+        # Compacto (feedback Seb 2026-08-25): el summary NO va en el preview
+        assert "first line" not in text
 
     def test_timed_out_with_bad_payload_does_not_raise(self):
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
-        assert "timed out" in text
+        assert "timeout" in text  # wording compacto
 
 
 class TestNotificationPollerLoopKanbanWiring:
@@ -328,9 +328,9 @@ class TestNotificationPollerLoopKanbanWiring:
             thread.join(timeout=5)
 
         status_texts = [p["text"] for e, p in emits if e == "status.update" and p]
-        assert any(tid in t for t in status_texts), status_texts
+        assert any("notify tui" in t for t in status_texts), status_texts
         assert any(e == "message.start" for e, _ in emits)
-        assert any(tid in text for text in submits), submits
+        assert any("notify tui" in text for text in submits), submits
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
 
@@ -357,6 +357,6 @@ class TestNotificationPollerLoopKanbanWiring:
             stop.set()
             thread.join(timeout=5)
 
-        assert any(tid in text for text in submits), submits
+        assert any("notify tui" in text for text in submits), submits
         assert session["_kanban_pending"] == []
         assert session["running"] is True

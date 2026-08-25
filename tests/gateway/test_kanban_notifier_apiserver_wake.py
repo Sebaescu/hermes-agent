@@ -129,7 +129,7 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
     assert posts[0]["session_id"] == "origin-session"
     assert all(post["session_id"] != "worker-session" for post in posts)
     wake_text = posts[0]["text"]
-    assert tid in wake_text
+    assert "notify once" in wake_text
     # Graph-safe wake turn (#70752): the synthetic turn must carry the
     # worker's completion handoff and the don't-recreate guidance so a
     # woken orchestrator doesn't re-decompose existing work.

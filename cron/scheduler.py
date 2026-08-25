@@ -184,11 +184,10 @@ def _failure_streak_nudge(job: dict) -> str:
     if streak < threshold:
         return ""
     job_ref = job.get("name") or job.get("id") or "this job"
-    return (
-        f"\nThis job has failed {streak} runs in a row — worth a review. "
-        f"Fix its prompt/config, or pause it with `hermes cron pause {job_ref}` "
-        "(resume/remove also available) to stop the noise."
-    )
+    # Compacto (feedback Seb 2026-08-25): el preview de la notificación debe
+    # ser 1 línea; el comando de pausa queda en el mensaje completo del chat,
+    # no en el preview.
+    return f" — {streak} fallos seguidos (pausa: hermes cron pause {job_ref})"
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -265,11 +264,9 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             reason = "weekly usage limit"
         elif "quota" in lower:
             reason = "quota limit"
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider {reason}. "
-            f"{_fallback_chain_phrase()} "
-            "Full details saved in cron output."
-        )
+        # Compacto (feedback Seb 2026-08-25): 1 línea, sin fallback-chain
+        # clause — el detalle vive en cron output. "failed:" → "falló:"
+        return f"⚠️ Cron '{job_name}' falló: {reason} (detalle en cron output)"
 
     # The scheduler's own inactivity watchdog (see the TimeoutError raised
     # above at "Cron job '{job_name}' idle for {secs}s (limit {limit}s) —

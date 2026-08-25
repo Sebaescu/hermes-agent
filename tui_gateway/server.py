@@ -10027,32 +10027,25 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     tag = f"@{who} " if who else ""
     payload = getattr(ev, "payload", None) or {}
     if kind == "completed":
-        handoff = ""
-        summary = payload.get("summary")
-        if summary:
-            lines = str(summary).strip().splitlines()
-            handoff = f"\n{lines[0][:200]}" if lines else ""
-        elif getattr(task, "result", None):
-            lines = str(task.result).strip().splitlines()
-            handoff = f"\n{lines[0][:160]}" if lines else ""
-        return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+        # Notificación compacta (feedback Seb 2026-08-25: los previews eran
+        # muros de texto técnico). Solo el título; el summary/result vive en
+        # el board y el chat si se pide. Sin task_id en el preview.
+        return f"✔ {board_tag}{tag}{title}"
     if kind == "blocked":
-        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
-        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+        # Razón de UNA línea, truncada corta — el detalle está en el board.
+        reason = ""
+        if payload.get("reason"):
+            first = str(payload["reason"]).strip().splitlines()[0]
+            reason = f" — {first[:60]}"
+        return f"⏸ {board_tag}{tag}{title}{reason}"
     if kind == "gave_up":
-        err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
+        return f"✖ {board_tag}{tag}{title} — reintentos agotados"
     if kind == "crashed":
-        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
+        return f"✖ {board_tag}{tag}{title} — crashed, reintento automático"
     if kind == "timed_out":
-        limit = 0
-        try:
-            limit = int(payload.get("limit_seconds") or 0)
-        except (TypeError, ValueError):
-            pass
-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+        return f"⏱ {board_tag}{tag}{title} — timeout, reintento automático"
     if kind == "status":
-        return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
+        return f"🔄 {board_tag}{tag}{title} → {payload.get('status') or ''}"
     return None
 
 

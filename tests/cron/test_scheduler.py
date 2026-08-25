@@ -41,10 +41,12 @@ class TestSummarizeCronFailureForDelivery:
             "HTTP 429: Too Many Requests",
         )
 
-        assert "provider rate limit" in summary
-        # Chain wording is now honest (#85508): either the exhausted phrase
-        # (chain configured) or the "No fallback chain configured" guidance.
-        assert "fallback chain" in summary.lower()
+        # Compacto (feedback Seb 2026-08-25): la entrega de chat es 1 línea —
+        # clasifica rate limit, sin fallback-chain clause (el detalle vive en
+        # cron output).
+        assert "rate limit" in summary
+        assert "falló" in summary
+        assert "\n" not in summary
 
     def test_no_agent_rate_limit_does_not_claim_a_fallback_chain(self):
         summary = _summarize_cron_failure_for_delivery(
@@ -2803,9 +2805,10 @@ class TestFailureStreakNudge:
     def test_nudges_at_threshold(self):
         from cron.scheduler import _failure_streak_nudge
         # stored streak 2 + this run = 3 >= default threshold 3
+        # Compacto (feedback Seb 2026-08-25): nudge de 1 línea en español.
         with patch("cron.scheduler.load_config", return_value={}):
             out = _failure_streak_nudge(self._job(2))
-        assert "failed 3 runs in a row" in out
+        assert "3 fallos seguidos" in out
         assert "hermes cron pause scout" in out
 
     def test_silent_below_threshold(self):
@@ -2824,7 +2827,7 @@ class TestFailureStreakNudge:
         cfg5 = {"cron": {"failure_nudge_threshold": 5}}
         with patch("cron.scheduler.load_config", return_value=cfg5):
             assert _failure_streak_nudge(self._job(3)) == ""
-            assert "failed 5 runs" in _failure_streak_nudge(self._job(4))
+            assert "5 fallos seguidos" in _failure_streak_nudge(self._job(4))
         with patch("cron.scheduler.load_config", return_value={"cron": {"failure_nudge_threshold": 0}}):
             assert _failure_streak_nudge(self._job(50)) == ""
 
@@ -2837,4 +2840,4 @@ class TestFailureStreakNudge:
     def test_config_load_failure_falls_back(self):
         from cron.scheduler import _failure_streak_nudge
         with patch("cron.scheduler.load_config", side_effect=RuntimeError("boom")):
-            assert "failed 3 runs" in _failure_streak_nudge(self._job(2))
+            assert "3 fallos seguidos" in _failure_streak_nudge(self._job(2))
