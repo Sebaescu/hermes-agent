@@ -20,6 +20,7 @@ import logging
 import os
 import platform
 import re
+import random
 import signal
 import subprocess
 
@@ -923,6 +924,50 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._close_bridge_log()
         print(f"[{self.name}] Disconnected")
     
+
+    # --- Owner-presence handover (WA clients v2) --------------------------
+    def _handover_idle_minutes(self) -> float:
+        """Minutes the owner must be silent before the assistant resumes a
+        client chat. From whatsapp-settings.json (handover_idle_minutes, 15)."""
+        try:
+            import json as _json
+            ws = _json.load(open(os.path.expanduser(
+                "~/.hermes/whatsapp-settings.json")))
+            return float(ws.get("handover_idle_minutes", 15))
+        except Exception:
+            return 15.0
+
+    def _notify_chat_id(self) -> Optional[str]:
+        """Owner's notification chat id (WhatsApp own JID) for handover notices."""
+        try:
+            import json as _json
+            creds = _json.load(open(os.path.expanduser(
+                "~/.hermes/whatsapp/session/creds.json")))
+            me = (creds.get("me") or {}).get("id") or ""
+            if me:
+                return me.split(":")[0].split("@")[0] + "@s.whatsapp.net"
+        except Exception:
+            pass
+        return None
+
+    async def _notify_handover_resume(self, chat_id: str) -> None:
+        """Telegram/WhatsApp ping: assistant resumed a client chat after owner
+        went idle. Sends via bridge to the owner's own chat (self-chat)."""
+        target = self._notify_chat_id()
+        if not target:
+            return
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as sess:
+                await sess.post(
+                    f"http://127.0.0.1:{self._bridge_port}/send",
+                    json={"chatId": target,
+                          "message": f"retome el chat con {chat_id.split('@')[0]}, llevabas sin responder un rato"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+        except Exception:
+            pass
+
     async def send(
         self,
         chat_id: str,
@@ -943,6 +988,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        # [[NOREPLY]] / [[_END]] — agent-decided silence / conversation end
+        # (WhatsApp client flows: stickers & low-value messages get NO reply).
+        _stripped = content.strip()
+        if _stripped == "[[NOREPLY]]":
+            return SendResult(success=True, message_id=None)
+        _end_flag = "[[_END]]" in _stripped
+        if _end_flag:
+            _stripped = _stripped.replace("[[_END]]", "").strip()
+        content = _stripped
 
         chat_id = to_whatsapp_jid(chat_id)
 
@@ -997,6 +1052,25 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
             sent_message_ids: list[str] = []
             last_message_id = None
+            # Typing indicator antes del primer bubble (humaniza; knob off → skip)
+            try:
+                import json as _json2
+                _ws2 = _json2.load(open(os.path.expanduser(
+                    "~/.hermes/whatsapp-settings.json")))
+                _typing_sim2 = bool(_ws2.get("typing_simulation", True))
+            except Exception:
+                _typing_sim2 = True
+            if _typing_sim2:
+                try:
+                    async with self._http_session.post(
+                        f"http://127.0.0.1:{self._bridge_port}/typing",
+                        json={"chatId": chat_id},
+                        timeout=aiohttp.ClientTimeout(total=3),
+                    ) as _typing_resp:
+                        pass
+                except Exception:
+                    pass
+                await asyncio.sleep(min(1.5 + len(content) / 60.0, 4.0))
             for idx, chunk in enumerate(chunks):
                 payload: Dict[str, Any] = {
                     "chatId": chat_id,
@@ -1021,24 +1095,32 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         error = await resp.text()
                         return SendResult(success=False, error=error)
 
-                # Small delay between chunks to avoid rate limiting
+                # Small delay between chunks to avoid rate limiting AND to
+                # mimic human typing rhythm (randomized 2-5s, knob-off → 0.3s).
                 if len(chunks) > 1:
-                    await asyncio.sleep(0.3)
+                    _typing_sim = True
+                    _delay_range = (2.0, 5.0)
+                    try:
+                        import json as _json
+                        _ws = _json.load(open(os.path.expanduser(
+                            "~/.hermes/whatsapp-settings.json")))
+                        _typing_sim = bool(_ws.get("typing_simulation", True))
+                        _rng = _ws.get("bubble_delay_ms", [2000, 5000])
+                        _delay_range = (float(_rng[0]) / 1000.0, float(_rng[1]) / 1000.0)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(
+                        random.uniform(*_delay_range) if _typing_sim else 0.3
+                    )
 
-            return SendResult(
-                success=True,
-                message_id=last_message_id,
-                continuation_message_ids=tuple(sent_message_ids[:-1]),
-                raw_response={"message_ids": sent_message_ids},
-            )
-
-            # Auto-close conversation when reply is short or disengaging
-            # to stop burning tokens on off-topic chatter.
+            # Auto-close conversation when the agent signals end ([[ _END ]])
+            # or replies a short disengagement — stops burning tokens on
+            # off-topic chatter. (Unreachable before: an early return hid it.)
             _DISENGAGE_WORDS = {'oka','ah ya','jaja','jajaja','mm','mmm','sii','dale','ok','buena','no','jaja no','ya','nel'}
-            _reply_lower = formatted.strip().lower().rstrip('.,!?')
-            # Check: exact match, OR first line is disengage, OR total reply is short (<15 chars)
+            _reply_lower = content.strip().lower().rstrip('.,!?')
             _first_line = _reply_lower.split('\n')[0].strip() if '\n' in _reply_lower else _reply_lower
-            _is_disengage = (_reply_lower in _DISENGAGE_WORDS
+            _is_disengage = (_end_flag
+                             or _reply_lower in _DISENGAGE_WORDS
                              or _first_line in _DISENGAGE_WORDS
                              or len(_reply_lower) < 15)
             if _is_disengage and not chat_id.endswith('@g.us'):
@@ -1051,6 +1133,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         pass
                 except Exception:
                     pass
+
+            return SendResult(
+                success=True,
+                message_id=last_message_id,
+                continuation_message_ids=tuple(sent_message_ids[:-1]),
+                raw_response={"message_ids": sent_message_ids},
+            )
 
         except Exception as e:
             return SendResult(success=False, error=str(e))
@@ -1411,6 +1500,40 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 # delay message dispatch (matches BlueBubbles
                                 # asyncio.create_task pattern for mark_read).
                                 asyncio.create_task(self._send_read_receipt(msg_data))
+                                # --- Owner-presence handover (WA clients v2) ---
+                                # fromMe/owner-typed messages in a client chat:
+                                # record presence; while fresh (< idle minutes)
+                                # client messages are NOT auto-answered. Client
+                                # messages still flow to the session history via
+                                # _should_process pass — but here we drop them
+                                # from dispatch when the owner is present, and
+                                # resume with a Telegram notice when idle past
+                                # the watchdog window.
+                                if msg_data.get("fromOwner") or msg_data.get("fromMe"):
+                                    try:
+                                        if getattr(self, "_owner_present_until", None) is None:
+                                            self._owner_present_until = {}
+                                        self._owner_present_until[msg_data.get("chatId", "")] = (
+                                            __import__("time").time()
+                                            + 60.0 * self._handover_idle_minutes()
+                                        )
+                                    except Exception:
+                                        pass
+                                _chat = msg_data.get("chatId", "")
+                                _until = (getattr(self, "_owner_present_until", None) or {}).get(_chat, 0.0)
+                                if _until and not (msg_data.get("fromOwner") or msg_data.get("fromMe")):
+                                    import time as _time
+                                    if _time.time() < _until:
+                                        # owner present: keep context, no auto-reply
+                                        print(f"[{self.name}] handover: owner present, dropping auto-reply for {_chat}")
+                                        continue
+                                    else:
+                                        # watchdog: resume + notify owner once
+                                        (getattr(self, "_owner_present_until", None) or {}).pop(_chat, None)
+                                        try:
+                                            asyncio.create_task(self._notify_handover_resume(_chat))
+                                        except Exception:
+                                            pass
                                 if event.message_type == MessageType.TEXT:
                                     self._enqueue_text_event(event)
                                 else:

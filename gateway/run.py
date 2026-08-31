@@ -5894,6 +5894,20 @@ class TurnRunner:
         def _notice_callback_sync(notice) -> None:
             if not ctx._status_adapter or not ctx._run_still_current():
                 return
+            # Client-facing platforms (WA clientes) nunca reciben notices de
+            # infraestructura (créditos, cuotas): son ruido interno. Config:
+            # display.client_facing_platforms (default: whatsapp).
+            try:
+                _cfp = (ctx.user_config.get("display", {}) or {}).get(
+                    "client_facing_platforms"
+                )
+                if _cfp is None:
+                    _cfp = ["whatsapp"]
+                if _platform_config_key(ctx.source.platform) in [str(p).lower() for p in _cfp]:
+                    logger.debug("notice suppressed for client-facing platform")
+                    return
+            except Exception:
+                pass
             try:
                 line = render_notice_line(notice)
             except Exception:
@@ -5978,7 +5992,17 @@ class TurnRunner:
         #   off     — no chat notification (still logged to stdout)
         #   on      — generic "💾 Memory updated" (default)
         #   verbose — content preview: "💾 Memory ➕ Hermes Repo..."
-        _mem_notif = ctx.user_config.get("display", {}).get("memory_notifications")
+        # Per-platform override wins: display.platforms.<platform>.memory_notifications
+        # (matches config_defaults' documented behavior and resolve_display_setting).
+        from gateway.display_config import resolve_display_setting
+
+        _mem_notif = resolve_display_setting(
+            ctx.user_config,
+            _platform_config_key(ctx.source.platform),
+            "memory_notifications",
+        )
+        if _mem_notif is None:
+            _mem_notif = ctx.user_config.get("display", {}).get("memory_notifications")
         if isinstance(_mem_notif, bool):
             _mem_notif = "on" if _mem_notif else "off"
         agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
@@ -9523,6 +9547,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         duplicated here.
         """
         config = getattr(self, "config", None)
+        prompt = ""
         if config:
             override = _get_channel_override(
                 config,
@@ -9532,8 +9557,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 parent_id=parent_id,
             )
             if override and override.system_prompt:
-                return (override.system_prompt or "").strip()
-        return getattr(self, "_ephemeral_system_prompt", None) or ""
+                prompt = (override.system_prompt or "").strip()
+            else:
+                prompt = getattr(self, "_ephemeral_system_prompt", None) or ""
+        else:
+            prompt = getattr(self, "_ephemeral_system_prompt", None) or ""
+
+        # Temporal context block (local date/time) so the agent never greets
+        # "lindo dia" at 10pm. Resolved once per turn (this fn runs per turn,
+        # not per message) — prompt-cache safe. Opt-out via
+        # display.temporal_context: false or per-platform list
+        # display.temporal_context_platforms (default: whatsapp, telegram).
+        try:
+            from gateway.display_config import resolve_display_setting
+
+            user_cfg = {}
+            cfg_obj = getattr(self, "_config", None) or config
+            if isinstance(cfg_obj, dict):
+                user_cfg = cfg_obj
+            else:
+                user_cfg = getattr(cfg_obj, "raw", None) or {}
+            enabled = resolve_display_setting(user_cfg, _platform_config_key(platform), "temporal_context")
+            if enabled is None:
+                enabled = bool(user_cfg.get("display", {}).get("temporal_context", True))
+            platforms_cfg = (user_cfg.get("display", {}) or {}).get("temporal_context_platforms")
+            plat_key = _platform_config_key(platform)
+            if enabled and platforms_cfg is not None:
+                enabled = plat_key in [str(p).lower() for p in platforms_cfg]
+            if enabled and platforms_cfg is None and plat_key not in {"whatsapp", "telegram", "cli", "local"}:
+                enabled = False
+            if enabled and prompt:
+                from zoneinfo import ZoneInfo
+                from datetime import datetime as _dt
+
+                _dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+                _meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+                          "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+                now = _dt.now(ZoneInfo("America/Guayaquil"))
+                bloque = (
+                    f"[Contexto: {_dias[now.weekday()]} {now.day} de {_meses[now.month - 1]} "
+                    f"de {now.year}, {now:%H:%M} hora local (GMT-5). Úsalo para saludos y "
+                    f"referencias de tiempo.]"
+                )
+                prompt = f"{prompt}\n\n{bloque}"
+        except Exception:
+            pass
+        return prompt
 
     @staticmethod
     def _load_reasoning_config(model: str = "") -> dict | None:
