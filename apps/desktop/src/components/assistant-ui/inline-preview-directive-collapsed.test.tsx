@@ -27,7 +27,11 @@ vi.mock('@/lib/media', () => ({
 import { InlinePreviewDirective } from './inline-preview-directive'
 
 function renderDirective(node: ReactNode) {
-  return render(<I18nProvider configClient={null} initialLocale="en">{node}</I18nProvider>)
+  return render(
+    <I18nProvider configClient={null} initialLocale="en">
+      {node}
+    </I18nProvider>
+  )
 }
 
 describe('InlinePreviewDirective collapsed by default', () => {
@@ -69,6 +73,7 @@ describe('InlinePreviewDirective collapsed by default', () => {
     const frame = await waitFor(() => {
       const el = document.querySelector('iframe')
       expect(el).not.toBeNull()
+
       return el as HTMLIFrameElement
     })
 

@@ -263,9 +263,7 @@ export function InlinePreviewDirective({
     return file ? <PreviewAttachment source="explicit-link" target={file} /> : null
   }
 
-  return (
-    <CollapsedInlinePreview file={file} initialHeight={directiveFrameHeight(attrs.height)} streaming={streaming} />
-  )
+  return <CollapsedInlinePreview file={file} initialHeight={directiveFrameHeight(attrs.height)} streaming={streaming} />
 }
 
 /**
@@ -304,9 +302,7 @@ function CollapsedInlinePreview({
           {open ? t.preview.hide : t.preview.openPreview}
         </button>
       </div>
-      {open && (
-        <InlineHtmlFrame file={file} initialHeight={initialHeight} streaming={streaming} className="mt-1.5" />
-      )}
+      {open && <InlineHtmlFrame className="mt-1.5" file={file} initialHeight={initialHeight} streaming={streaming} />}
     </div>
   )
 }
