@@ -9545,23 +9545,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Legacy ``channel_prompts`` are applied separately via ``event.channel_prompt``
         in ``run_sync`` (adapter ``resolve_channel_prompt``), so they are not
         duplicated here.
+
+        WhatsApp persona resolution:
+        - If chat_id maps to a contact with persona="casual" in whatsapp-contacts.json,
+          load and use the casual prompt from ~/.hermes/whatsapp-personas/casual.txt
+        - If persona="hermes" or field missing, fall back to channel_overrides/default.
         """
         config = getattr(self, "config", None)
         prompt = ""
-        if config:
-            override = _get_channel_override(
-                config,
-                platform,
-                chat_id,
-                thread_id=thread_id,
-                parent_id=parent_id,
-            )
-            if override and override.system_prompt:
-                prompt = (override.system_prompt or "").strip()
+
+        # WhatsApp persona resolution: check contacts for persona="casual"
+        if str(platform).lower() == "whatsapp":
+            persona = self._resolve_whatsapp_persona(chat_id)
+            if persona == "casual":
+                prompt = self._load_casual_prompt()
+            elif persona == "hermes":
+                # Fall through to normal channel_overrides logic
+                pass
+
+        if not prompt:
+            if config:
+                override = _get_channel_override(
+                    config,
+                    platform,
+                    chat_id,
+                    thread_id=thread_id,
+                    parent_id=parent_id,
+                )
+                if override and override.system_prompt:
+                    prompt = (override.system_prompt or "").strip()
+                else:
+                    prompt = getattr(self, "_ephemeral_system_prompt", None) or ""
             else:
                 prompt = getattr(self, "_ephemeral_system_prompt", None) or ""
-        else:
-            prompt = getattr(self, "_ephemeral_system_prompt", None) or ""
 
         # Temporal context block (local date/time) so the agent never greets
         # "lindo dia" at 10pm. Resolved once per turn (this fn runs per turn,
@@ -9603,6 +9619,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
         return prompt
+
+    def _resolve_whatsapp_persona(self, chat_id: str) -> str:
+        """Resolve WhatsApp persona for a chat_id from whatsapp-contacts.json.
+        Returns: 'casual' | 'hermes' | '' (empty = not found, use default).
+        Cached per instance."""
+        if not hasattr(self, "_whatsapp_persona_cache"):
+            self._whatsapp_persona_cache = {}
+        if chat_id in self._whatsapp_persona_cache:
+            return self._whatsapp_persona_cache[chat_id]
+
+        contacts_file = os.path.expanduser("~/.hermes/whatsapp-contacts.json")
+        try:
+            with open(contacts_file) as f:
+                data = json.load(f)
+            for contact in data.get("contacts", []):
+                if contact.get("phone") == chat_id:
+                    persona = contact.get("persona", "hermes")
+                    self._whatsapp_persona_cache[chat_id] = persona
+                    return persona
+        except Exception:
+            pass
+        self._whatsapp_persona_cache[chat_id] = ""
+        return ""
+
+    def _load_casual_prompt(self) -> str:
+        """Load casual prompt from ~/.hermes/whatsapp-personas/casual.txt.
+        Cached per instance."""
+        if not hasattr(self, "_casual_prompt_cache"):
+            self._casual_prompt_cache = None
+        if self._casual_prompt_cache is not None:
+            return self._casual_prompt_cache
+
+        prompt_file = os.path.expanduser("~/.hermes/whatsapp-personas/casual.txt")
+        try:
+            with open(prompt_file) as f:
+                self._casual_prompt_cache = f.read().strip()
+        except Exception:
+            self._casual_prompt_cache = ""
+        return self._casual_prompt_cache or ""
 
     @staticmethod
     def _load_reasoning_config(model: str = "") -> dict | None:
