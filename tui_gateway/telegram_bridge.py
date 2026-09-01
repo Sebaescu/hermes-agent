@@ -139,8 +139,23 @@ def _tg_api_post(token: str, method: str, payload: dict) -> Optional[dict]:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = json.loads(resp.read().decode("utf-8") or "{}")
+        try:
+            urlopen = urllib.request.urlopen
+            with urlopen(req, timeout=10) as resp:
+                body = json.loads(resp.read().decode("utf-8") or "{}")
+        except urllib.error.URLError as ssl_exc:
+            # venv sin CA store del sistema (NixOS): reintentar con certifi
+            if "CERTIFICATE_VERIFY_FAILED" not in str(ssl_exc):
+                raise
+            import ssl as _ssl
+            try:
+                import certifi
+
+                ctx = _ssl.create_default_context(cafile=certifi.where())
+            except ImportError:
+                ctx = _ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                body = json.loads(resp.read().decode("utf-8") or "{}")
         if not body.get("ok"):
             logger.warning(
                 "telegram bridge: %s failed: %s", method, body.get("description")
@@ -243,18 +258,72 @@ def _send_text(text: str) -> None:
 # engine es FIFO — la primera pendiente es la más vieja, que es la que tiene
 # tarjeta). Al resolverse en CUALQUIER canal (tap de Telegram, botón del
 # Desktop, /approve) se edita: botones fuera + sufijo "✅ resuelto".
+# Estado COMPARTIDO entre procesos (gateway envía con aiohttp, dashboard/
+# serve resuelven): archivo con lock — in-memory solo no alcanza (regla
+# @user 01/09: aceptó en Desktop y la tarjeta TG quedaba viva).
 _LIVE_CARDS: dict[str, dict[str, Any]] = {}
+
+import json as _json_mod
+
+
+def _cards_file() -> Path:
+    d = Path.home() / ".hermes" / "runtime"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "tg-live-cards.json"
+
+
+_cards_lock = threading.Lock()
+
+
+def _cards_load() -> dict:
+    try:
+        with open(_cards_file()) as f:
+            data = _json_mod.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cards_save(data: dict) -> None:
+    try:
+        tmp = str(_cards_file()) + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(_json_mod.dumps(data))
+        os.replace(tmp, _cards_file())
+    except Exception:
+        pass
+
+
+def _cards_register(sk_hash: str, card: dict) -> None:
+    with _cards_lock:
+        data = _cards_load()
+        data[sk_hash] = card
+        # cap: 64 tarjetas vivas máximo (las viejas expiran solas al resolverse)
+        while len(data) > 64:
+            data.pop(next(iter(data)))
+        _cards_save(data)
+
+
+def _cards_take(sk_hash: str) -> Optional[dict]:
+    with _cards_lock:
+        data = _cards_load()
+        card = data.pop(sk_hash, None)
+        if card is not None:
+            _cards_save(data)
+    return card
 
 
 def _mark_card(session_key_hash: str, target: dict, sent: Optional[dict]) -> None:
     """Record chat/message ids of a sent card (best-effort, sent = TG result)."""
     try:
         if isinstance(sent, dict) and sent.get("message_id"):
-            _LIVE_CARDS[session_key_hash] = {
+            card = {
                 "chat_id": target["chat_id"],
                 "message_id": sent["message_id"],
                 "text": str(target.get("text") or ""),
             }
+            _LIVE_CARDS[session_key_hash] = card
+            _cards_register(session_key_hash, card)
     except Exception:
         pass
 
@@ -267,6 +336,10 @@ def _resolve_card(session_key_hash: str, choice: str = "") -> None:
     process; gateway tap → gateway process) — each edits its own cards.
     """
     card = _LIVE_CARDS.pop(session_key_hash, None)
+    if card is None:
+        card = _cards_take(session_key_hash)
+    else:
+        _cards_take(session_key_hash)  # limpiar el compartido si estaba en ambos
     if not card:
         return
 

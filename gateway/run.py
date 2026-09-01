@@ -6343,8 +6343,8 @@ class TurnRunner:
                 if _target is None:
                     return
                 tg_adapter, home_chat_id = _target
-                safe_schedule_threadsafe(
-                    tg_adapter.send_exec_approval(
+                async def _send_and_register():
+                    result = await tg_adapter.send_exec_approval(
                         chat_id=home_chat_id,
                         command=cmd,
                         session_key=_approval_session_key,
@@ -6353,7 +6353,29 @@ class TurnRunner:
                         allow_permanent=approval_data.get("allow_permanent", True),
                         allow_session=approval_data.get("allow_session", True),
                         smart_denied=approval_data.get("smart_denied", False),
-                    ),
+                    )
+                    # Registrar en el estado compartido para que un resolve
+                    # desde Desktop/dashboard (otro proceso) edite ESTA tarjeta.
+                    try:
+                        if getattr(result, "success", False) and getattr(result, "message_id", None):
+                            import hashlib as _hl
+
+                            sk_hash = _hl.sha256(
+                                str(_approval_session_key).encode("utf-8")
+                            ).hexdigest()[:8]
+                            from tui_gateway.telegram_bridge import _cards_register
+
+                            _cards_register(sk_hash, {
+                                "chat_id": home_chat_id,
+                                "message_id": int(result.message_id),
+                                "text": "",
+                            })
+                    except Exception:
+                        pass
+                    return result
+
+                safe_schedule_threadsafe(
+                    _send_and_register(),
                     ctx._loop_for_step,
                     logger=logger,
                     log_message="approval-mirror send scheduling error",
