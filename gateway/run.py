@@ -9626,8 +9626,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Cached per instance."""
         if not hasattr(self, "_whatsapp_persona_cache"):
             self._whatsapp_persona_cache = {}
-        if chat_id in self._whatsapp_persona_cache:
-            return self._whatsapp_persona_cache[chat_id]
+        # TTL 30s: la UI de contacts escribe el JSON y el cambio debe verse
+        # en el siguiente mensaje sin restart del gateway (regla @user 01/09).
+        now = time.time()
+        cached = self._whatsapp_persona_cache.get(chat_id)
+        if cached is not None and now - cached[1] < 30:
+            return cached[0]
 
         contacts_file = os.path.expanduser("~/.hermes/whatsapp-contacts.json")
         try:
@@ -9636,11 +9640,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for contact in data.get("contacts", []):
                 if contact.get("phone") == chat_id:
                     persona = contact.get("persona", "hermes")
-                    self._whatsapp_persona_cache[chat_id] = persona
+                    self._whatsapp_persona_cache[chat_id] = (persona, now)
                     return persona
         except Exception:
             pass
-        self._whatsapp_persona_cache[chat_id] = ""
+        self._whatsapp_persona_cache[chat_id] = ("", now)
         return ""
 
     def _load_casual_prompt(self) -> str:
