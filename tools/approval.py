@@ -2665,6 +2665,19 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if not queue:
             _gateway_queues.pop(session_key, None)
 
+    # Marcar la tarjeta espejo de Telegram (si este proceso la envió):
+    # botones fuera + "✅ Resuelto" — resuelto en Desktop, TG o /approve.
+    if targets:
+        try:
+            from tui_gateway.telegram_bridge import _resolve_card
+
+            for entry in targets:
+                sk = str(entry.data.get("session_key") or session_key)
+                sk_hash = hashlib.sha256(sk.encode("utf-8")).hexdigest()[:8]
+                _resolve_card(sk_hash, choice)
+        except Exception:
+            pass
+
     for entry in targets:
         entry.result = choice
         if reason:

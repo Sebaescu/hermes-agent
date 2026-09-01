@@ -220,7 +220,12 @@ def _send_card(text: str, rows) -> None:
     }
     if target.get("thread_id"):
         payload["message_thread_id"] = target["thread_id"]
-    _fire_and_forget(_tg_api_post, target["token"], "sendMessage", payload)
+    return _tg_api_post(target["token"], "sendMessage", payload)
+
+
+def _send_card_async(text: str, rows) -> None:
+    """Fire-and-forget wrapper (prompt paths must never block)."""
+    _fire_and_forget(_send_card, text, rows)
 
 
 def _send_text(text: str) -> None:
@@ -231,6 +236,60 @@ def _send_text(text: str) -> None:
     if target.get("thread_id"):
         payload["message_thread_id"] = target["thread_id"]
     _fire_and_forget(_tg_api_post, target["token"], "sendMessage", payload)
+
+
+# Tarjetas de approval/clarify vivas por sesión: sk_hash → {"chat_id",
+# "message_id", "text"}. Última tarjeta por sesión (la cola de approvals del
+# engine es FIFO — la primera pendiente es la más vieja, que es la que tiene
+# tarjeta). Al resolverse en CUALQUIER canal (tap de Telegram, botón del
+# Desktop, /approve) se edita: botones fuera + sufijo "✅ resuelto".
+_LIVE_CARDS: dict[str, dict[str, Any]] = {}
+
+
+def _mark_card(session_key_hash: str, target: dict, sent: Optional[dict]) -> None:
+    """Record chat/message ids of a sent card (best-effort, sent = TG result)."""
+    try:
+        if isinstance(sent, dict) and sent.get("message_id"):
+            _LIVE_CARDS[session_key_hash] = {
+                "chat_id": target["chat_id"],
+                "message_id": sent["message_id"],
+                "text": str(target.get("text") or ""),
+            }
+    except Exception:
+        pass
+
+
+def _resolve_card(session_key_hash: str, choice: str = "") -> None:
+    """Edit the live card for this session: buttons off + resolved note.
+
+    Fire-and-forget on a daemon thread — resolve paths must never block.
+    Runs in whichever process resolved the prompt (Desktop tap → dashboard
+    process; gateway tap → gateway process) — each edits its own cards.
+    """
+    card = _LIVE_CARDS.pop(session_key_hash, None)
+    if not card:
+        return
+
+    def _edit() -> None:
+        try:
+            target = _load_mirror_target()
+            if not target:
+                return
+            token = target["token"]
+            text = card["text"]
+            note = f"\n✅ Resuelto{' — ' + choice if choice else ''} (Desktop/TG)"
+            if len(text) + len(note) < 4000:
+                text += note
+            _tg_api_post(token, "editMessageText", {
+                "chat_id": card["chat_id"],
+                "message_id": card["message_id"],
+                "text": text,
+                "parse_mode": "HTML",
+            })
+        except Exception:
+            logger.debug("tg bridge: card resolve edit failed", exc_info=True)
+
+    threading.Thread(target=_edit, daemon=True, name="tg-bridge-edit").start()
 
 
 def _approval_button_rows(session_key: str, choices: list[str]) -> list[list[dict]]:
@@ -281,9 +340,15 @@ def mirror_approval(sid: str, session_key: str, data: dict | None) -> None:
         # Telegram caps messages at 4096 chars; trim the command, keep header.
         if len(body) > 3800:
             body = body[:3797] + "…"
-        _send_card(
-            body, lambda: _approval_button_rows(session_key, choices)
-        )
+        sk_hash = _remember_sk_hash(session_key)
+        target0 = _load_mirror_target()
+
+        def _send_tracked() -> None:
+            sent = _send_card(body, lambda: _approval_button_rows(session_key, choices))
+            if target0:
+                _mark_card(sk_hash, {**target0, "text": body}, sent)
+
+        _fire_and_forget(_send_tracked)
     except Exception:
         logger.debug("telegram bridge: approval mirror failed", exc_info=True)
 
