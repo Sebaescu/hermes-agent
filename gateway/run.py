@@ -9568,10 +9568,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         in ``run_sync`` (adapter ``resolve_channel_prompt``), so they are not
         duplicated here.
 
-        WhatsApp persona resolution:
-        - If chat_id maps to a contact with persona="casual" in whatsapp-contacts.json,
-          load and use the casual prompt from ~/.hermes/whatsapp-personas/casual.txt
-        - If persona="hermes" or field missing, fall back to channel_overrides/default.
+        WhatsApp persona resolution (regla @user 01/09 — 3 tipos):
+        - persona="casual" → ~/.hermes/whatsapp-personas/casual.txt (tono Seb).
+        - persona="hermes" → hermes.txt (asistente de trabajo genérico), SALVO
+          que el contacto tenga channel_override propio (capa específica gana).
+        - persona="custom" → SIEMPRE channel_overrides del JID (prompt a medida;
+          sin override definido cae al default del gateway).
+        - campo ausente → fallback default (comportamiento legacy).
         """
         config = getattr(self, "config", None)
         prompt = ""
@@ -9579,11 +9582,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # WhatsApp persona resolution: check contacts for persona="casual"
         if str(platform).lower() == "whatsapp":
             persona = self._resolve_whatsapp_persona(chat_id)
+            has_override = False
+            if config is not None:
+                _ov = _get_channel_override(
+                    config, platform, chat_id,
+                    thread_id=thread_id, parent_id=parent_id,
+                )
+                has_override = bool(_ov and _ov.system_prompt)
             if persona == "casual":
                 prompt = self._load_casual_prompt()
-            elif persona == "hermes":
-                # Fall through to normal channel_overrides logic
-                pass
+            elif persona == "hermes" and not has_override:
+                # genérico de trabajo; con override propio lo aplica el bloque
+                # de abajo (capa específica encima del genérico)
+                prompt = self._load_hermes_prompt()
+            elif persona == "custom" and not has_override:
+                pass  # sin override definido: cae al default del gateway
 
         if not prompt:
             if config:
@@ -9667,6 +9680,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
         self._whatsapp_persona_cache[chat_id] = ("", now)
+        return ""
+
+    def _load_hermes_prompt(self) -> str:
+        """Load work-assistant prompt from ~/.hermes/whatsapp-personas/hermes.txt.
+        Cached per instance (mismo patrón que _load_casual_prompt)."""
+        if not hasattr(self, "_hermes_prompt_cache"):
+            self._hermes_prompt_cache = None
+        if self._hermes_prompt_cache is not None:
+            return self._hermes_prompt_cache
+
+        prompt_file = os.path.expanduser("~/.hermes/whatsapp-personas/hermes.txt")
+        try:
+            with open(prompt_file) as f:
+                prompt = f.read().strip()
+            if prompt:
+                self._hermes_prompt_cache = prompt
+                return prompt
+        except Exception:
+            pass
         return ""
 
     def _load_casual_prompt(self) -> str:
